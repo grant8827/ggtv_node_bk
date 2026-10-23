@@ -245,7 +245,9 @@ function playoutPlan() {
   const now = new Date().toISOString();
   const slot = db.schedule.find((entry) => entry.kind === "playlist" && entry.start <= now && entry.end > now);
   const playlist = slot && db.playlists.find((item) => item.id === slot.playlistId);
-  return playlist?.items.length ? { slot, playlist } : null;
+  // Browser-stored files can't be reached from here, so scheduled playout uses the linked items only.
+  const items = playlist?.items.filter((item) => item.url) ?? [];
+  return items.length ? { slot, playlist: { ...playlist, items } } : null;
 }
 
 const playout = startPlayout({
@@ -313,12 +315,24 @@ function playlistInput(body) {
   const name = text(body.name, "Playlist name", { min: 1, max: 80 });
   if (!Array.isArray(body.items)) throw new HttpError(400, "Items must be a list");
   if (body.items.length > 500) throw new HttpError(400, "A playlist can hold up to 500 items");
-  const items = body.items.map((item, index) => ({
-    id: typeof item?.id === "string" && item.id ? item.id : randomUUID(),
-    title: text(item?.title, `Item ${index + 1} title`, { min: 1, max: 120 }),
-    url: mediaUrl(item?.url, `Item ${index + 1} URL`),
-    durationMinutes: minutes(item?.durationMinutes, `Item ${index + 1} duration`),
-  }));
+  const items = body.items.map((item, index) => {
+    const label = `Item ${index + 1}`;
+    const base = {
+      id: typeof item?.id === "string" && item.id ? item.id : randomUUID(),
+      title: text(item?.title, `${label} title`, { min: 1, max: 120 }),
+      durationMinutes: minutes(item?.durationMinutes, `${label} duration`),
+    };
+    // A video file kept in the studio browser's IndexedDB: only that browser's switcher can play it.
+    if (item?.fileId) {
+      return {
+        ...base,
+        url: null,
+        fileId: text(item.fileId, `${label} file`, { min: 1, max: 64 }),
+        fileName: text(item.fileName, `${label} file name`, { max: 200 }),
+      };
+    }
+    return { ...base, url: mediaUrl(item?.url, `${label} URL`) };
+  });
   return { name, items };
 }
 
