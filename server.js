@@ -297,20 +297,13 @@ function findIndex(list, id, label) {
 // SRS treats an HTTP 200 with code 0 as "allow"; anything else rejects the publisher.
 async function srsHook(request, response, action) {
   const body = await readJson(request);
-  if (body.stream !== db.live.streamName) {
+  // SRS sends the publisher's query string as `param` on both publish and unpublish.
+  const key = new URLSearchParams(String(body.param || "").replace(/^\?/, "")).get("key") || "";
+  if (body.stream !== db.live.streamName || !timingSafeEqual(digest(key), digest(db.live.streamKey))) {
     sendJson(response, 403, { code: 1 });
     return;
   }
-  if (action === "publish") {
-    const key = new URLSearchParams(String(body.param || "").replace(/^\?/, "")).get("key") || "";
-    if (!timingSafeEqual(digest(key), digest(db.live.streamKey))) {
-      sendJson(response, 403, { code: 1 });
-      return;
-    }
-    db.live.encoderConnected = true;
-  } else {
-    db.live.encoderConnected = false;
-  }
+  db.live.encoderConnected = action === "publish";
   await saveDb();
   sendJson(response, 200, { code: 0 });
 }
