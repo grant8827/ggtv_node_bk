@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { startPlayout } from "./playout.js";
 import { attachSwitcherOutput } from "./switcherOutput.js";
+import { createMediaStore } from "./media.js";
 
 const port = Number(process.env.PORT) || 3001;
 const appDir = path.dirname(fileURLToPath(import.meta.url));
@@ -14,6 +15,9 @@ const dataDir = process.env.DATA_DIR || path.join(appDir, "data");
 // The built frontend (frontend/dist) is served from this same origin so the studio session cookie works.
 const staticDir = path.resolve(process.env.STATIC_DIR || path.join(appDir, "../frontend/dist"));
 const dbFile = path.join(dataDir, "studio.json");
+// Uploaded videos. On Railway this is the backend's volume (MEDIA_DIR=/data/media).
+const mediaDir = process.env.MEDIA_DIR || path.join(dataDir, "media");
+const maxUploadBytes = (Number(process.env.MAX_UPLOAD_GB) || 5) * 1e9;
 // With DATABASE_URL set (Railway), studio state lives in Postgres; otherwise in a local JSON file.
 const pool = process.env.DATABASE_URL ? new pg.Pool({ connectionString: process.env.DATABASE_URL }) : null;
 const rtmpUrl = process.env.RTMP_INGEST_URL || "rtmp://localhost:1935/live";
@@ -53,6 +57,7 @@ function defaultDb() {
     },
     schedule: [],
     playlists: [],
+    media: [],
   };
 }
 
@@ -240,13 +245,19 @@ async function login(request, response) {
 
 // ---------- views ----------
 
+const mediaStore = createMediaStore({ dir: mediaDir, maxUploadBytes, HttpError });
+
 function playoutPlan() {
   if (db.live.isLive) return null;
   const now = new Date().toISOString();
   const slot = db.schedule.find((entry) => entry.kind === "playlist" && entry.start <= now && entry.end > now);
   const playlist = slot && db.playlists.find((item) => item.id === slot.playlistId);
-  // Browser-stored files can't be reached from here, so scheduled playout uses the linked items only.
-  const items = playlist?.items.filter((item) => item.url) ?? [];
+  // Links and uploaded videos can play from here; files kept in a studio browser can't.
+  const items = (playlist?.items ?? []).flatMap((item) => {
+    if (item.url) return [{ ...item, input: item.url }];
+    const media = item.mediaId && db.media.find((entry) => entry.id === item.mediaId);
+    return media ? [{ ...item, input: mediaStore.pathOf(media), isLocal: true }] : [];
+  });
   return items.length ? { slot, playlist: { ...playlist, items } } : null;
 }
 
@@ -322,6 +333,12 @@ function playlistInput(body) {
       title: text(item?.title, `${label} title`, { min: 1, max: 120 }),
       durationMinutes: minutes(item?.durationMinutes, `${label} duration`),
     };
+    // A video uploaded to the server's media storage.
+    if (item?.mediaId) {
+      const media = db.media.find((entry) => entry.id === item.mediaId);
+      if (!media) throw new HttpError(400, `${label}: the uploaded video no longer exists`);
+      return { ...base, url: null, mediaId: media.id, fileName: media.name };
+    }
     // A video file kept in the studio browser's IndexedDB: only that browser's switcher can play it.
     if (item?.fileId) {
       return {
@@ -340,6 +357,13 @@ function findIndex(list, id, label) {
   const index = list.findIndex((item) => item.id === id);
   if (index === -1) throw new HttpError(404, `${label} not found`);
   return index;
+}
+
+async function mediaList() {
+  const used = db.media.reduce((sum, media) => sum + media.size, 0);
+  const { free } = await mediaStore.usage();
+  const usedBy = (id) => db.playlists.filter((playlist) => playlist.items.some((item) => item.mediaId === id)).map((playlist) => playlist.name);
+  return { items: db.media.map((media) => ({ ...media, usedBy: usedBy(media.id) })), used, free };
 }
 
 // ---------- SRS hooks ----------
@@ -467,6 +491,26 @@ const routes = [
   ["DELETE", /^\/api\/studio\/schedule\/([\w-]+)$/, true, async (request, response, { params }) => {
     db.schedule.splice(findIndex(db.schedule, params[0], "Schedule entry"), 1);
     await saveDb();
+    sendJson(response, 200, { ok: true });
+  }],
+
+  ["GET", "/api/studio/media", true, async (request, response) => sendJson(response, 200, await mediaList())],
+  ["POST", "/api/studio/media", true, async (request, response) => {
+    const media = await mediaStore.upload(request);
+    db.media.push(media);
+    await saveDb();
+    sendJson(response, 201, media);
+  }],
+  ["GET", /^\/api\/studio\/media\/([\w-]+)\/file$/, true, async (request, response, { params }) => {
+    await mediaStore.serve(request, response, db.media[findIndex(db.media, params[0], "Video")]);
+  }],
+  ["DELETE", /^\/api\/studio\/media\/([\w-]+)$/, true, async (request, response, { params }) => {
+    const index = findIndex(db.media, params[0], "Video");
+    const users = db.playlists.filter((playlist) => playlist.items.some((item) => item.mediaId === params[0]));
+    if (users.length) throw new HttpError(409, `This video is used in: ${users.map((playlist) => playlist.name).join(", ")}`);
+    const [media] = db.media.splice(index, 1);
+    await saveDb();
+    await mediaStore.remove(media);
     sendJson(response, 200, { ok: true });
   }],
 

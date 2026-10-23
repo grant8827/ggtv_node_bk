@@ -25,9 +25,10 @@ function ffmpegArgs(item, offsetSec, output) {
   return [
     "-hide_banner", "-loglevel", "error", "-nostdin",
     "-re",
-    "-protocol_whitelist", "http,https,tcp,tls,crypto",
+    // Uploaded videos are local files; links may only use network protocols.
+    "-protocol_whitelist", item.isLocal ? "file" : "http,https,tcp,tls,crypto",
     ...(offsetSec > 0 ? ["-ss", String(offsetSec)] : []),
-    "-i", item.url,
+    "-i", item.input ?? item.url,
     ...(limit ? ["-t", String(limit)] : []),
     // Re-encode every item to one format so the outgoing stream stays consistent between items.
     "-vf", "scale=-2:720,fps=30",
