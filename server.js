@@ -1,0 +1,416 @@
+import { createServer } from "node:http";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const port = Number(process.env.PORT) || 3001;
+const dataDir = process.env.DATA_DIR || path.join(path.dirname(fileURLToPath(import.meta.url)), "data");
+const dbFile = path.join(dataDir, "studio.json");
+const rtmpUrl = process.env.RTMP_INGEST_URL || "rtmp://localhost:1935/live";
+const hlsBaseUrl = (process.env.HLS_BASE_URL || "http://localhost:8080/live").replace(/\/$/, "");
+const secureCookie = process.env.NODE_ENV === "production";
+
+const studioUser = process.env.STUDIO_USERNAME || "admin";
+let studioPassword = process.env.STUDIO_PASSWORD;
+if (!studioPassword) {
+  studioPassword = randomBytes(9).toString("base64url");
+  console.warn(`STUDIO_PASSWORD is not set. Temporary studio login for this run: ${studioUser} / ${studioPassword}`);
+}
+
+const sessionCookie = "ggtv_session";
+const sessionTtlMs = 12 * 60 * 60 * 1000;
+const sessions = new Map();
+const loginFailures = new Map();
+const maxLoginFailures = 5;
+const loginLockMs = 15 * 60 * 1000;
+
+// ---------- storage ----------
+
+function defaultDb() {
+  return {
+    live: {
+      isLive: false,
+      title: "GGTV Live",
+      description: "",
+      startedAt: null,
+      streamName: "demo",
+      streamKey: randomBytes(12).toString("hex"),
+      encoderConnected: false,
+    },
+    schedule: [],
+    playlists: [],
+  };
+}
+
+async function loadDb() {
+  try {
+    const stored = JSON.parse(await readFile(dbFile, "utf8"));
+    const fallback = defaultDb();
+    return { ...fallback, ...stored, live: { ...fallback.live, ...stored.live } };
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    return defaultDb();
+  }
+}
+
+const db = await loadDb();
+let saving = Promise.resolve();
+
+function saveDb() {
+  saving = saving.then(async () => {
+    await mkdir(dataDir, { recursive: true });
+    const tmp = `${dbFile}.tmp`;
+    await writeFile(tmp, JSON.stringify(db, null, 2));
+    await rename(tmp, dbFile);
+  });
+  return saving;
+}
+
+await saveDb();
+
+// ---------- http helpers ----------
+
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function sendJson(response, status, body, headers = {}) {
+  response.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store", ...headers });
+  response.end(JSON.stringify(body));
+}
+
+async function readJson(request) {
+  if (!String(request.headers["content-type"] || "").startsWith("application/json")) {
+    throw new HttpError(415, "Expected a JSON body");
+  }
+  let size = 0;
+  const chunks = [];
+  for await (const chunk of request) {
+    size += chunk.length;
+    if (size > 256 * 1024) throw new HttpError(413, "Request body is too large");
+    chunks.push(chunk);
+  }
+  try {
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+    if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error();
+    return body;
+  } catch {
+    throw new HttpError(400, "Malformed JSON body");
+  }
+}
+
+function parseCookies(header = "") {
+  return Object.fromEntries(
+    header.split(";").map((part) => part.trim().split("=")).filter(([key, value]) => key && value).map(([key, value]) => [key, decodeURIComponent(value)]),
+  );
+}
+
+function cookieHeader(value, maxAgeSeconds) {
+  return [
+    `${sessionCookie}=${value}`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Strict",
+    `Max-Age=${maxAgeSeconds}`,
+    secureCookie ? "Secure" : "",
+  ].filter(Boolean).join("; ");
+}
+
+function clientIp(request) {
+  return request.socket.remoteAddress || "unknown";
+}
+
+// ---------- validation ----------
+
+function text(value, field, { min = 0, max }) {
+  const result = typeof value === "string" ? value.trim() : "";
+  if (result.length < min) throw new HttpError(400, `${field} is required`);
+  if (result.length > max) throw new HttpError(400, `${field} must be ${max} characters or fewer`);
+  return result;
+}
+
+function isoDate(value, field) {
+  const date = new Date(typeof value === "string" ? value : "");
+  if (Number.isNaN(date.getTime())) throw new HttpError(400, `${field} must be a valid date`);
+  return date.toISOString();
+}
+
+function mediaUrl(value, field) {
+  const result = text(value, field, { min: 1, max: 2048 });
+  let url;
+  try {
+    url = new URL(result);
+  } catch {
+    throw new HttpError(400, `${field} must be a valid URL`);
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") throw new HttpError(400, `${field} must use http or https`);
+  return url.toString();
+}
+
+function minutes(value, field) {
+  const result = Number(value ?? 0);
+  if (!Number.isFinite(result) || result < 0 || result > 1440) throw new HttpError(400, `${field} must be between 0 and 1440 minutes`);
+  return Math.round(result * 100) / 100;
+}
+
+// ---------- auth ----------
+
+function digest(value) {
+  return createHash("sha256").update(String(value)).digest();
+}
+
+function credentialsMatch(username, password) {
+  const userOk = timingSafeEqual(digest(username), digest(studioUser));
+  const passwordOk = timingSafeEqual(digest(password), digest(studioPassword));
+  return userOk && passwordOk;
+}
+
+function currentSession(request) {
+  const token = parseCookies(request.headers.cookie)[sessionCookie];
+  if (!token) return null;
+  const session = sessions.get(token);
+  if (!session) return null;
+  if (session.expiresAt < Date.now()) {
+    sessions.delete(token);
+    return null;
+  }
+  return { token, ...session };
+}
+
+async function login(request, response) {
+  const ip = clientIp(request);
+  const failures = loginFailures.get(ip);
+  if (failures && failures.count >= maxLoginFailures && failures.until > Date.now()) {
+    throw new HttpError(429, "Too many failed attempts. Try again in a few minutes.");
+  }
+
+  const body = await readJson(request);
+  if (!credentialsMatch(body.username ?? "", body.password ?? "")) {
+    const next = failures && failures.until > Date.now() ? failures.count + 1 : 1;
+    loginFailures.set(ip, { count: next, until: Date.now() + loginLockMs });
+    throw new HttpError(401, "Incorrect username or password");
+  }
+
+  loginFailures.delete(ip);
+  const token = randomBytes(32).toString("base64url");
+  sessions.set(token, { user: studioUser, expiresAt: Date.now() + sessionTtlMs });
+  sendJson(response, 200, { user: studioUser }, { "Set-Cookie": cookieHeader(token, sessionTtlMs / 1000) });
+}
+
+// ---------- views ----------
+
+function publicLive() {
+  const { isLive, title, description, startedAt, streamName, encoderConnected } = db.live;
+  return { isLive, title, description, startedAt, encoderConnected, hlsUrl: `${hlsBaseUrl}/${streamName}.m3u8` };
+}
+
+function studioLive() {
+  return { ...publicLive(), streamName: db.live.streamName, streamKey: db.live.streamKey, rtmpUrl };
+}
+
+function scheduleView(entries) {
+  return [...entries]
+    .sort((a, b) => a.start.localeCompare(b.start))
+    .map((entry) => ({ ...entry, playlistName: db.playlists.find((playlist) => playlist.id === entry.playlistId)?.name ?? null }));
+}
+
+// ---------- schedule & playlists ----------
+
+function scheduleInput(body, ignoreId) {
+  const title = text(body.title, "Title", { min: 1, max: 120 });
+  const description = text(body.description, "Description", { max: 500 });
+  const start = isoDate(body.start, "Start time");
+  const end = isoDate(body.end, "End time");
+  if (end <= start) throw new HttpError(400, "End time must be after the start time");
+
+  const kind = body.kind === "playlist" ? "playlist" : "live";
+  let playlistId = null;
+  if (kind === "playlist") {
+    playlistId = typeof body.playlistId === "string" ? body.playlistId : "";
+    if (!db.playlists.some((playlist) => playlist.id === playlistId)) throw new HttpError(400, "Choose a playlist for this slot");
+  }
+
+  const clash = db.schedule.find((entry) => entry.id !== ignoreId && entry.start < end && start < entry.end);
+  if (clash) throw new HttpError(409, `Overlaps with "${clash.title}"`);
+
+  return { title, description, start, end, kind, playlistId };
+}
+
+function playlistInput(body) {
+  const name = text(body.name, "Playlist name", { min: 1, max: 80 });
+  if (!Array.isArray(body.items)) throw new HttpError(400, "Items must be a list");
+  if (body.items.length > 500) throw new HttpError(400, "A playlist can hold up to 500 items");
+  const items = body.items.map((item, index) => ({
+    id: typeof item?.id === "string" && item.id ? item.id : randomUUID(),
+    title: text(item?.title, `Item ${index + 1} title`, { min: 1, max: 120 }),
+    url: mediaUrl(item?.url, `Item ${index + 1} URL`),
+    durationMinutes: minutes(item?.durationMinutes, `Item ${index + 1} duration`),
+  }));
+  return { name, items };
+}
+
+function findIndex(list, id, label) {
+  const index = list.findIndex((item) => item.id === id);
+  if (index === -1) throw new HttpError(404, `${label} not found`);
+  return index;
+}
+
+// ---------- SRS hooks ----------
+
+// Configure SRS http_hooks on_publish / on_unpublish to point here (see infra/srs/srs.conf).
+// SRS treats an HTTP 200 with code 0 as "allow"; anything else rejects the publisher.
+async function srsHook(request, response, action) {
+  const body = await readJson(request);
+  if (body.stream !== db.live.streamName) {
+    sendJson(response, 403, { code: 1 });
+    return;
+  }
+  if (action === "publish") {
+    const key = new URLSearchParams(String(body.param || "").replace(/^\?/, "")).get("key") || "";
+    if (!timingSafeEqual(digest(key), digest(db.live.streamKey))) {
+      sendJson(response, 403, { code: 1 });
+      return;
+    }
+    db.live.encoderConnected = true;
+  } else {
+    db.live.encoderConnected = false;
+  }
+  await saveDb();
+  sendJson(response, 200, { code: 0 });
+}
+
+// ---------- routes ----------
+
+const routes = [
+  ["GET", "/health", false, (request, response) => sendJson(response, 200, { status: "ok" })],
+
+  ["POST", "/api/auth/login", false, login],
+  ["POST", "/api/auth/logout", false, (request, response) => {
+    // Browsers can't send custom headers cross-site without a CORS preflight, which this server never grants.
+    if (request.method !== "GET" && !pathname.startsWith("/api/hooks/") && request.headers["x-ggtv-studio"] !== "1") {
+      throw new HttpError(403, "Missing studio request header");
+    }
+
+    const session = currentSession(request);
+    if (session) sessions.delete(session.token);
+    sendJson(response, 200, { ok: true }, { "Set-Cookie": cookieHeader("", 0) });
+  }],
+  ["GET", "/api/auth/session", true, (request, response, { session }) => sendJson(response, 200, { user: session.user })],
+
+  ["GET", "/api/live", false, (request, response) => sendJson(response, 200, publicLive())],
+  ["GET", "/api/schedule", false, (request, response) => {
+    const now = new Date().toISOString();
+    sendJson(response, 200, scheduleView(db.schedule.filter((entry) => entry.end > now)).slice(0, 50));
+  }],
+
+  ["POST", "/api/hooks/srs/on_publish", false, (request, response) => srsHook(request, response, "publish")],
+  ["POST", "/api/hooks/srs/on_unpublish", false, (request, response) => srsHook(request, response, "unpublish")],
+
+  ["GET", "/api/studio/live", true, (request, response) => sendJson(response, 200, studioLive())],
+  ["POST", "/api/studio/live/start", true, async (request, response) => {
+    const body = await readJson(request);
+    db.live.title = text(body.title, "Broadcast title", { min: 1, max: 120 });
+    db.live.description = text(body.description, "Description", { max: 500 });
+    if (!db.live.isLive) db.live.startedAt = new Date().toISOString();
+    db.live.isLive = true;
+    await saveDb();
+    sendJson(response, 200, studioLive());
+  }],
+  ["POST", "/api/studio/live/stop", true, async (request, response) => {
+    db.live.isLive = false;
+    db.live.startedAt = null;
+    await saveDb();
+    sendJson(response, 200, studioLive());
+  }],
+  ["POST", "/api/studio/live/key", true, async (request, response) => {
+    db.live.streamKey = randomBytes(12).toString("hex");
+    await saveDb();
+    sendJson(response, 200, studioLive());
+  }],
+
+  ["GET", "/api/studio/schedule", true, (request, response) => sendJson(response, 200, scheduleView(db.schedule))],
+  ["POST", "/api/studio/schedule", true, async (request, response) => {
+    const entry = { id: randomUUID(), ...scheduleInput(await readJson(request)) };
+    db.schedule.push(entry);
+    await saveDb();
+    sendJson(response, 201, entry);
+  }],
+  ["PUT", /^\/api\/studio\/schedule\/([\w-]+)$/, true, async (request, response, { params }) => {
+    const index = findIndex(db.schedule, params[0], "Schedule entry");
+    db.schedule[index] = { id: params[0], ...scheduleInput(await readJson(request), params[0]) };
+    await saveDb();
+    sendJson(response, 200, db.schedule[index]);
+  }],
+  ["DELETE", /^\/api\/studio\/schedule\/([\w-]+)$/, true, async (request, response, { params }) => {
+    db.schedule.splice(findIndex(db.schedule, params[0], "Schedule entry"), 1);
+    await saveDb();
+    sendJson(response, 200, { ok: true });
+  }],
+
+  ["GET", "/api/studio/playlists", true, (request, response) => sendJson(response, 200, db.playlists)],
+  ["POST", "/api/studio/playlists", true, async (request, response) => {
+    const playlist = { id: randomUUID(), ...playlistInput(await readJson(request)), updatedAt: new Date().toISOString() };
+    db.playlists.push(playlist);
+    await saveDb();
+    sendJson(response, 201, playlist);
+  }],
+  ["PUT", /^\/api\/studio\/playlists\/([\w-]+)$/, true, async (request, response, { params }) => {
+    const index = findIndex(db.playlists, params[0], "Playlist");
+    db.playlists[index] = { id: params[0], ...playlistInput(await readJson(request)), updatedAt: new Date().toISOString() };
+    await saveDb();
+    sendJson(response, 200, db.playlists[index]);
+  }],
+  ["DELETE", /^\/api\/studio\/playlists\/([\w-]+)$/, true, async (request, response, { params }) => {
+    const index = findIndex(db.playlists, params[0], "Playlist");
+    if (db.schedule.some((entry) => entry.playlistId === params[0])) {
+      throw new HttpError(409, "This playlist is used in the schedule. Remove those slots first.");
+    }
+    db.playlists.splice(index, 1);
+    await saveDb();
+    sendJson(response, 200, { ok: true });
+  }],
+];
+
+function matchRoute(method, pathname) {
+  let pathExists = false;
+  for (const [routeMethod, pattern, requiresAuth, handler] of routes) {
+    const match = typeof pattern === "string" ? (pattern === pathname ? [] : null) : pathname.match(pattern)?.slice(1);
+    if (!match) continue;
+    pathExists = true;
+    if (routeMethod === method) return { requiresAuth, handler, params: match };
+  }
+  return pathExists ? "method" : null;
+}
+
+const server = createServer(async (request, response) => {
+  try {
+    const { pathname } = new URL(request.url, "http://localhost");
+    const route = matchRoute(request.method, pathname);
+    if (route === "method") throw new HttpError(405, "Method not allowed");
+    if (!route) throw new HttpError(404, "Not found");
+
+    // Browsers can't send custom headers cross-site without a CORS preflight, which this server never grants.
+    if (request.method !== "GET" && !pathname.startsWith("/api/hooks/") && request.headers["x-ggtv-studio"] !== "1") {
+      throw new HttpError(403, "Missing studio request header");
+    }
+
+    const session = currentSession(request);
+    if (route.requiresAuth && !session) throw new HttpError(401, "Sign in to the studio to continue");
+    await route.handler(request, response, { params: route.params, session });
+  } catch (error) {
+    if (error instanceof HttpError) {
+      sendJson(response, error.status, { error: error.message });
+      return;
+    }
+    console.error(error);
+    sendJson(response, 500, { error: "Internal server error" });
+  }
+});
+
+server.listen(port, () => {
+  console.log(`Node backend listening on http://localhost:${port}`);
+});
