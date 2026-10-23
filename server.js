@@ -398,11 +398,6 @@ const routes = [
 
   ["POST", "/api/auth/login", false, login],
   ["POST", "/api/auth/logout", false, (request, response) => {
-    // Browsers can't send custom headers cross-site without a CORS preflight, which this server never grants.
-    if (request.method !== "GET" && !pathname.startsWith("/api/hooks/") && request.headers["x-ggtv-studio"] !== "1") {
-      throw new HttpError(403, "Missing studio request header");
-    }
-
     const session = currentSession(request);
     if (session) sessions.delete(session.token);
     sendJson(response, 200, { ok: true }, { "Set-Cookie": cookieHeader("", 0) });
