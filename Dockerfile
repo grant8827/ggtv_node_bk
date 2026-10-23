@@ -4,6 +4,6 @@ RUN apk add --no-cache ffmpeg
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
-COPY server.js playout.js ./
+COPY server.js playout.js switcherOutput.js ./
 ENV NODE_ENV=production
 CMD ["node", "server.js"]

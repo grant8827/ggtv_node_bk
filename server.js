@@ -6,6 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { startPlayout } from "./playout.js";
+import { attachSwitcherOutput } from "./switcherOutput.js";
 
 const port = Number(process.env.PORT) || 3001;
 const appDir = path.dirname(fileURLToPath(import.meta.url));
@@ -270,7 +271,14 @@ function publicLive() {
 }
 
 function studioLive() {
-  return { ...publicLive(), streamName: db.live.streamName, streamKey: db.live.streamKey, rtmpUrl, playout: playout.status() };
+  return {
+    ...publicLive(),
+    streamName: db.live.streamName,
+    streamKey: db.live.streamKey,
+    rtmpUrl,
+    playout: playout.status(),
+    switcherOutput: switcherOutput.status(),
+  };
 }
 
 function scheduleView(entries) {
@@ -517,6 +525,27 @@ const server = createServer(async (request, response) => {
   }
 });
 
+// The browser switcher streams its program output here; it publishes as the live encoder.
+const switcherOutput = attachSwitcherOutput(server, {
+  path: "/api/studio/switcher/output",
+  authorize(request) {
+    const session = currentSession(request);
+    if (!session) return "401 Unauthorized";
+    // Cookies ride along on cross-site WebSocket handshakes, so require our own origin.
+    let originHost = null;
+    try {
+      originHost = new URL(request.headers.origin).host;
+    } catch {
+      return "403 Forbidden";
+    }
+    if (originHost !== request.headers.host) return "403 Forbidden";
+    request.studioUser = session.user;
+    return null;
+  },
+  publishUrl: () => `${playoutRtmpUrl}/${db.live.streamName}?key=${db.live.streamKey}`,
+  ffmpegPath: process.env.FFMPEG_PATH || "ffmpeg",
+});
+
 server.listen(port, () => {
   console.log(`Node backend listening on http://localhost:${port} (storage: ${pool ? "postgres" : dbFile})`);
 });
@@ -524,6 +553,7 @@ server.listen(port, () => {
 for (const signal of ["SIGTERM", "SIGINT"]) {
   process.on(signal, () => {
     playout.shutdown();
+    switcherOutput.shutdown();
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 3000).unref();
   });
