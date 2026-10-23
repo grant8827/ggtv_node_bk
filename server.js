@@ -5,6 +5,7 @@ import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
+import { startPlayout } from "./playout.js";
 
 const port = Number(process.env.PORT) || 3001;
 const appDir = path.dirname(fileURLToPath(import.meta.url));
@@ -16,6 +17,9 @@ const dbFile = path.join(dataDir, "studio.json");
 const pool = process.env.DATABASE_URL ? new pg.Pool({ connectionString: process.env.DATABASE_URL }) : null;
 const rtmpUrl = process.env.RTMP_INGEST_URL || "rtmp://localhost:1935/live";
 const hlsBaseUrl = (process.env.HLS_BASE_URL || "http://localhost:8080/live").replace(/\/$/, "");
+// Scheduled playlists are pushed to SRS as their own stream; on Railway use SRS's private address.
+const playoutRtmpUrl = (process.env.PLAYOUT_RTMP_URL || rtmpUrl).replace(/\/$/, "");
+const playoutStream = "playout";
 const onRailway = Boolean(process.env.RAILWAY_ENVIRONMENT_NAME);
 const secureCookie = process.env.NODE_ENV === "production" || onRailway;
 
@@ -235,13 +239,38 @@ async function login(request, response) {
 
 // ---------- views ----------
 
+function playoutPlan() {
+  if (db.live.isLive) return null;
+  const now = new Date().toISOString();
+  const slot = db.schedule.find((entry) => entry.kind === "playlist" && entry.start <= now && entry.end > now);
+  const playlist = slot && db.playlists.find((item) => item.id === slot.playlistId);
+  return playlist?.items.length ? { slot, playlist } : null;
+}
+
+const playout = startPlayout({
+  getPlan: playoutPlan,
+  publishUrl: () => `${playoutRtmpUrl}/${playoutStream}?key=${db.live.streamKey}`,
+  ffmpegPath: process.env.FFMPEG_PATH || "ffmpeg",
+});
+
 function publicLive() {
   const { isLive, title, description, startedAt, streamName, encoderConnected } = db.live;
-  return { isLive, title, description, startedAt, encoderConnected, hlsUrl: `${hlsBaseUrl}/${streamName}.m3u8` };
+  const run = playout.status();
+  const source = isLive ? "live" : run.state === "playing" ? "playlist" : "off";
+  return {
+    isLive,
+    source,
+    title,
+    description,
+    startedAt,
+    encoderConnected,
+    nowPlaying: source === "playlist" ? { slotTitle: run.slotTitle, itemTitle: run.itemTitle } : null,
+    hlsUrl: `${hlsBaseUrl}/${source === "playlist" ? playoutStream : streamName}.m3u8`,
+  };
 }
 
 function studioLive() {
-  return { ...publicLive(), streamName: db.live.streamName, streamKey: db.live.streamKey, rtmpUrl };
+  return { ...publicLive(), streamName: db.live.streamName, streamKey: db.live.streamKey, rtmpUrl, playout: playout.status() };
 }
 
 function scheduleView(entries) {
@@ -299,12 +328,15 @@ async function srsHook(request, response, action) {
   const body = await readJson(request);
   // SRS sends the publisher's query string as `param` on both publish and unpublish.
   const key = new URLSearchParams(String(body.param || "").replace(/^\?/, "")).get("key") || "";
-  if (body.stream !== db.live.streamName || !timingSafeEqual(digest(key), digest(db.live.streamKey))) {
+  const isEncoder = body.stream === db.live.streamName;
+  if ((!isEncoder && body.stream !== playoutStream) || !timingSafeEqual(digest(key), digest(db.live.streamKey))) {
     sendJson(response, 403, { code: 1 });
     return;
   }
-  db.live.encoderConnected = action === "publish";
-  await saveDb();
+  if (isEncoder) {
+    db.live.encoderConnected = action === "publish";
+    await saveDb();
+  }
   sendJson(response, 200, { code: 0 });
 }
 
@@ -386,12 +418,14 @@ const routes = [
     if (!db.live.isLive) db.live.startedAt = new Date().toISOString();
     db.live.isLive = true;
     await saveDb();
+    playout.refresh();
     sendJson(response, 200, studioLive());
   }],
   ["POST", "/api/studio/live/stop", true, async (request, response) => {
     db.live.isLive = false;
     db.live.startedAt = null;
     await saveDb();
+    playout.refresh();
     sendJson(response, 200, studioLive());
   }],
   ["POST", "/api/studio/live/key", true, async (request, response) => {
@@ -486,3 +520,11 @@ const server = createServer(async (request, response) => {
 server.listen(port, () => {
   console.log(`Node backend listening on http://localhost:${port} (storage: ${pool ? "postgres" : dbFile})`);
 });
+
+for (const signal of ["SIGTERM", "SIGINT"]) {
+  process.on(signal, () => {
+    playout.shutdown();
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 3000).unref();
+  });
+}
