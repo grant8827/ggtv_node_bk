@@ -1,15 +1,23 @@
 import { createServer } from "node:http";
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import pg from "pg";
 
 const port = Number(process.env.PORT) || 3001;
-const dataDir = process.env.DATA_DIR || path.join(path.dirname(fileURLToPath(import.meta.url)), "data");
+const appDir = path.dirname(fileURLToPath(import.meta.url));
+const dataDir = process.env.DATA_DIR || path.join(appDir, "data");
+// The built frontend (frontend/dist) is served from this same origin so the studio session cookie works.
+const staticDir = path.resolve(process.env.STATIC_DIR || path.join(appDir, "../frontend/dist"));
 const dbFile = path.join(dataDir, "studio.json");
+// With DATABASE_URL set (Railway), studio state lives in Postgres; otherwise in a local JSON file.
+const pool = process.env.DATABASE_URL ? new pg.Pool({ connectionString: process.env.DATABASE_URL }) : null;
 const rtmpUrl = process.env.RTMP_INGEST_URL || "rtmp://localhost:1935/live";
 const hlsBaseUrl = (process.env.HLS_BASE_URL || "http://localhost:8080/live").replace(/\/$/, "");
-const secureCookie = process.env.NODE_ENV === "production";
+const onRailway = Boolean(process.env.RAILWAY_ENVIRONMENT_NAME);
+const secureCookie = process.env.NODE_ENV === "production" || onRailway;
 
 const studioUser = process.env.STUDIO_USERNAME || "admin";
 let studioPassword = process.env.STUDIO_PASSWORD;
@@ -43,27 +51,49 @@ function defaultDb() {
   };
 }
 
-async function loadDb() {
+async function readStored() {
+  if (pool) {
+    await pool.query(
+      "CREATE TABLE IF NOT EXISTS studio_state (id smallint PRIMARY KEY, data jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())",
+    );
+    const { rows } = await pool.query("SELECT data FROM studio_state WHERE id = 1");
+    return rows[0]?.data ?? null;
+  }
   try {
-    const stored = JSON.parse(await readFile(dbFile, "utf8"));
-    const fallback = defaultDb();
-    return { ...fallback, ...stored, live: { ...fallback.live, ...stored.live } };
+    return JSON.parse(await readFile(dbFile, "utf8"));
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
-    return defaultDb();
+    return null;
   }
+}
+
+async function loadDb() {
+  const fallback = defaultDb();
+  const stored = await readStored();
+  if (!stored) return fallback;
+  return { ...fallback, ...stored, live: { ...fallback.live, ...stored.live } };
+}
+
+async function writeStored() {
+  if (pool) {
+    await pool.query(
+      "INSERT INTO studio_state (id, data) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = now()",
+      [JSON.stringify(db)],
+    );
+    return;
+  }
+  await mkdir(dataDir, { recursive: true });
+  const tmp = `${dbFile}.tmp`;
+  await writeFile(tmp, JSON.stringify(db, null, 2));
+  await rename(tmp, dbFile);
 }
 
 const db = await loadDb();
 let saving = Promise.resolve();
 
 function saveDb() {
-  saving = saving.then(async () => {
-    await mkdir(dataDir, { recursive: true });
-    const tmp = `${dbFile}.tmp`;
-    await writeFile(tmp, JSON.stringify(db, null, 2));
-    await rename(tmp, dbFile);
-  });
+  // Keep the queue alive after a failed write so later saves still run.
+  saving = saving.catch(() => undefined).then(writeStored);
   return saving;
 }
 
@@ -121,6 +151,8 @@ function cookieHeader(value, maxAgeSeconds) {
 }
 
 function clientIp(request) {
+  // Behind Railway's edge proxy the socket address is the proxy, so use the client IP it forwards.
+  if (onRailway && request.headers["x-real-ip"]) return String(request.headers["x-real-ip"]);
   return request.socket.remoteAddress || "unknown";
 }
 
@@ -283,6 +315,49 @@ async function srsHook(request, response, action) {
   sendJson(response, 200, { code: 0 });
 }
 
+// ---------- frontend ----------
+
+const contentTypes = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".json": "application/json",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".ico": "image/x-icon",
+  ".webmanifest": "application/manifest+json",
+  ".woff2": "font/woff2",
+};
+
+async function staticFile(pathname) {
+  let decoded;
+  try {
+    decoded = decodeURIComponent(pathname);
+  } catch {
+    return null;
+  }
+  const file = path.resolve(staticDir, `.${decoded}`);
+  if (!file.startsWith(staticDir + path.sep)) return null;
+  const info = await stat(file).catch(() => null);
+  return info?.isFile() ? file : null;
+}
+
+// Serves files from the frontend build, falling back to index.html so client-side routes like /studio load.
+async function serveFrontend(request, response, pathname) {
+  const isAsset = pathname.startsWith("/assets/");
+  const file = (await staticFile(pathname)) ?? (isAsset ? null : await staticFile("/index.html"));
+  if (!file) return false;
+  response.writeHead(200, {
+    "Content-Type": contentTypes[path.extname(file)] ?? "application/octet-stream",
+    "Cache-Control": isAsset ? "public, max-age=31536000, immutable" : "no-cache",
+    "X-Content-Type-Options": "nosniff",
+  });
+  if (request.method === "HEAD") response.end();
+  else createReadStream(file).pipe(response);
+  return true;
+}
+
 // ---------- routes ----------
 
 const routes = [
@@ -391,7 +466,11 @@ const server = createServer(async (request, response) => {
     const { pathname } = new URL(request.url, "http://localhost");
     const route = matchRoute(request.method, pathname);
     if (route === "method") throw new HttpError(405, "Method not allowed");
-    if (!route) throw new HttpError(404, "Not found");
+    if (!route) {
+      const canServePage = (request.method === "GET" || request.method === "HEAD") && !pathname.startsWith("/api/");
+      if (canServePage && (await serveFrontend(request, response, pathname))) return;
+      throw new HttpError(404, "Not found");
+    }
 
     // Browsers can't send custom headers cross-site without a CORS preflight, which this server never grants.
     if (request.method !== "GET" && !pathname.startsWith("/api/hooks/") && request.headers["x-ggtv-studio"] !== "1") {
@@ -412,5 +491,5 @@ const server = createServer(async (request, response) => {
 });
 
 server.listen(port, () => {
-  console.log(`Node backend listening on http://localhost:${port}`);
+  console.log(`Node backend listening on http://localhost:${port} (storage: ${pool ? "postgres" : dbFile})`);
 });
