@@ -302,31 +302,12 @@ function scheduleView(entries) {
 
 // ---------- schedule & playlists ----------
 
-function scheduleInput(body, ignoreId) {
-  const title = text(body.title, "Title", { min: 1, max: 120 });
-  const description = text(body.description, "Description", { max: 500 });
-  const start = isoDate(body.start, "Start time");
-  const end = isoDate(body.end, "End time");
-  if (end <= start) throw new HttpError(400, "End time must be after the start time");
-
-  const kind = body.kind === "playlist" ? "playlist" : "live";
-  let playlistId = null;
-  if (kind === "playlist") {
-    playlistId = typeof body.playlistId === "string" ? body.playlistId : "";
-    if (!db.playlists.some((playlist) => playlist.id === playlistId)) throw new HttpError(400, "Choose a playlist for this slot");
-  }
-
-  const clash = db.schedule.find((entry) => entry.id !== ignoreId && entry.start < end && start < entry.end);
-  if (clash) throw new HttpError(409, `Overlaps with "${clash.title}"`);
-
-  return { title, description, start, end, kind, playlistId };
-}
-
-function playlistInput(body) {
-  const name = text(body.name, "Playlist name", { min: 1, max: 80 });
-  if (!Array.isArray(body.items)) throw new HttpError(400, "Items must be a list");
-  if (body.items.length > 500) throw new HttpError(400, "A playlist can hold up to 500 items");
-  const items = body.items.map((item, index) => {
+// Video items shared by playlists and scheduled breaks: a link, an uploaded video, or a file
+// kept in a studio browser.
+function itemsInput(rawItems, max) {
+  if (!Array.isArray(rawItems)) throw new HttpError(400, "Items must be a list");
+  if (rawItems.length > max) throw new HttpError(400, `Up to ${max} videos are allowed`);
+  return rawItems.map((item, index) => {
     const label = `Item ${index + 1}`;
     const base = {
       id: typeof item?.id === "string" && item.id ? item.id : randomUUID(),
@@ -350,7 +331,53 @@ function playlistInput(body) {
     }
     return { ...base, url: mediaUrl(item?.url, `${label} URL`) };
   });
-  return { name, items };
+}
+
+function scheduleInput(body, ignoreId) {
+  const title = text(body.title, "Title", { min: 1, max: 120 });
+  const description = text(body.description, "Description", { max: 500 });
+  const start = isoDate(body.start, "Start time");
+  const kind = ["playlist", "break"].includes(body.kind) ? body.kind : "live";
+
+  let end;
+  let playlistId = null;
+  let items;
+  if (kind === "break") {
+    // A break plays its videos once; its end is when they're expected to finish.
+    items = itemsInput(body.items, 50);
+    if (!items.length) throw new HttpError(400, "Add at least one video to the break");
+    // Unknown lengths (0) still reserve a minute so the break has a window to start in.
+    const totalMinutes = items.reduce((sum, item) => sum + item.durationMinutes, 0) || 1;
+    end = new Date(Date.parse(start) + totalMinutes * 60000).toISOString();
+  } else {
+    end = isoDate(body.end, "End time");
+    if (end <= start) throw new HttpError(400, "End time must be after the start time");
+    if (kind === "playlist") {
+      playlistId = typeof body.playlistId === "string" ? body.playlistId : "";
+      if (!db.playlists.some((playlist) => playlist.id === playlistId)) throw new HttpError(400, "Choose a playlist for this slot");
+    }
+  }
+
+  // Breaks interrupt shows, so they may sit inside a show; they just can't overlap each other.
+  const isBreak = (entry) => entry.kind === "break";
+  const clash = db.schedule.find((entry) => entry.id !== ignoreId && isBreak(entry) === (kind === "break") && entry.start < end && start < entry.end);
+  if (clash) throw new HttpError(409, `Overlaps with "${clash.title}"`);
+
+  return { title, description, start, end, kind, playlistId, ...(items ? { items } : {}) };
+}
+
+function playlistInput(body) {
+  const name = text(body.name, "Playlist name", { min: 1, max: 80 });
+  return { name, items: itemsInput(body.items, 500) };
+}
+
+// Names of the playlists and breaks that use an uploaded video.
+function mediaUsers(mediaId) {
+  const uses = (items) => (items ?? []).some((item) => item.mediaId === mediaId);
+  return [
+    ...db.playlists.filter((playlist) => uses(playlist.items)).map((playlist) => playlist.name),
+    ...db.schedule.filter((entry) => uses(entry.items)).map((entry) => `break "${entry.title}"`),
+  ];
 }
 
 function findIndex(list, id, label) {
@@ -362,8 +389,7 @@ function findIndex(list, id, label) {
 async function mediaList() {
   const used = db.media.reduce((sum, media) => sum + media.size, 0);
   const { free } = await mediaStore.usage();
-  const usedBy = (id) => db.playlists.filter((playlist) => playlist.items.some((item) => item.mediaId === id)).map((playlist) => playlist.name);
-  return { items: db.media.map((media) => ({ ...media, usedBy: usedBy(media.id) })), used, free };
+  return { items: db.media.map((media) => ({ ...media, usedBy: mediaUsers(media.id) })), used, free };
 }
 
 // ---------- SRS hooks ----------
@@ -445,7 +471,9 @@ const routes = [
   ["GET", "/api/live", false, (request, response) => sendJson(response, 200, publicLive())],
   ["GET", "/api/schedule", false, (request, response) => {
     const now = new Date().toISOString();
-    sendJson(response, 200, scheduleView(db.schedule.filter((entry) => entry.end > now)).slice(0, 50));
+    // Breaks are for the studio's automation, not the public programme guide.
+    const listings = db.schedule.filter((entry) => entry.end > now && entry.kind !== "break").map(({ items, ...entry }) => entry);
+    sendJson(response, 200, scheduleView(listings).slice(0, 50));
   }],
 
   ["POST", "/api/hooks/srs/on_publish", false, (request, response) => srsHook(request, response, "publish")],
@@ -506,8 +534,8 @@ const routes = [
   }],
   ["DELETE", /^\/api\/studio\/media\/([\w-]+)$/, true, async (request, response, { params }) => {
     const index = findIndex(db.media, params[0], "Video");
-    const users = db.playlists.filter((playlist) => playlist.items.some((item) => item.mediaId === params[0]));
-    if (users.length) throw new HttpError(409, `This video is used in: ${users.map((playlist) => playlist.name).join(", ")}`);
+    const users = mediaUsers(params[0]);
+    if (users.length) throw new HttpError(409, `This video is used in: ${users.join(", ")}`);
     const [media] = db.media.splice(index, 1);
     await saveDb();
     await mediaStore.remove(media);

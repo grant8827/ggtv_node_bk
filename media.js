@@ -52,7 +52,10 @@ export function createMediaStore({ dir, maxUploadBytes, HttpError }) {
       if (error instanceof HttpError) throw error;
       throw new HttpError(400, "The upload was interrupted. Try again.");
     }
-    return { id, name, type, size: received, file, uploadedAt: new Date().toISOString() };
+    // The browser reads the video's length before uploading; it fills in playlist and break durations.
+    const seconds = Number(request.headers["x-duration-seconds"]);
+    const durationSeconds = Number.isFinite(seconds) && seconds > 0 && seconds < 86400 ? Math.round(seconds) : 0;
+    return { id, name, type, size: received, file, durationSeconds, uploadedAt: new Date().toISOString() };
   }
 
   // Sends a stored file, honouring Range requests so browsers can seek and read MP4 indexes.
