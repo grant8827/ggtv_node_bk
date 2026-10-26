@@ -503,6 +503,10 @@ async function serveFrontend(request, response, pathname) {
 
 // ---------- routes ----------
 
+// The public channel endpoints are read by the TV apps (Samsung, LG), which run from their own origin.
+// They carry no cookies or private data, so any origin may read them.
+const PUBLIC_READ = { "Access-Control-Allow-Origin": "*" };
+
 const routes = [
   ["GET", "/health", false, (request, response) => sendJson(response, 200, { status: "ok" })],
 
@@ -514,12 +518,12 @@ const routes = [
   }],
   ["GET", "/api/auth/session", true, (request, response, { session }) => sendJson(response, 200, { user: session.user })],
 
-  ["GET", "/api/live", false, (request, response) => sendJson(response, 200, publicLive())],
+  ["GET", "/api/live", false, (request, response) => sendJson(response, 200, publicLive(), PUBLIC_READ)],
   ["GET", "/api/schedule", false, (request, response) => {
     const now = new Date().toISOString();
     // Breaks are for the studio's automation, not the public programme guide.
     const listings = db.schedule.filter((entry) => entry.end > now && entry.kind !== "break").map(({ items, ...entry }) => entry);
-    sendJson(response, 200, scheduleView(listings).slice(0, 50));
+    sendJson(response, 200, scheduleView(listings).slice(0, 50), PUBLIC_READ);
   }],
 
   ["POST", "/api/hooks/srs/on_publish", false, (request, response) => srsHook(request, response, "publish")],
