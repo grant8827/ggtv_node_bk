@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 
-const tickMs = 5000;
+const tickMs = 1000;
 const retryDelayMs = 10_000;
 const quickFailSeconds = 5;
 
@@ -40,11 +40,19 @@ function ffmpegArgs(item, offsetSec, output) {
   ];
 }
 
-// Streams the playlist scheduled for the current slot into SRS, one ffmpeg process per item.
-// `getPlan` returns { slot, playlist } when something should play, or null.
+const IDLE = { state: "idle", kind: null, slotId: null, slotTitle: null, playlistName: null, itemTitle: null, error: null };
+
+// Streams what the channel should show into SRS, one ffmpeg process per item.
+// `getPlan` returns null, or a plan:
+//   { key, kind, id, title, playlistName, items, loop,
+//     alignTo?: ISO time  – start where the schedule says we should be by now (scheduled slots)
+//     resumeKey?: string  – carry on from where this was last stopped (the fill playlist)
+//     onFinished?: fn     – called when a non-looping plan (a break) has played every item }
+// A new key replaces whatever is playing.
 export function startPlayout({ getPlan, publishUrl, ffmpegPath = "ffmpeg" }) {
   let job = null;
-  let status = { state: "idle", slotId: null, slotTitle: null, playlistName: null, itemTitle: null, error: null };
+  let status = IDLE;
+  const positions = new Map();
 
   function playItem(current, item, offsetSec) {
     return new Promise((resolve) => {
@@ -66,15 +74,23 @@ export function startPlayout({ getPlan, publishUrl, ffmpegPath = "ffmpeg" }) {
     });
   }
 
-  async function run(current, { slot, playlist }) {
-    const items = playlist.items;
-    let { index, offsetSec } = startPosition(items, (Date.now() - Date.parse(slot.start)) / 1000);
+  function startOf(plan) {
+    if (plan.resumeKey && positions.has(plan.resumeKey)) return positions.get(plan.resumeKey);
+    if (plan.alignTo) return startPosition(plan.items, (Date.now() - Date.parse(plan.alignTo)) / 1000);
+    return { index: 0, offsetSec: 0 };
+  }
+
+  async function run(current, plan) {
+    const items = plan.items;
+    let { index, offsetSec } = startOf(plan);
+    if (index >= items.length) index = 0;
     let failuresInRow = 0;
 
     while (!current.stopped) {
       const item = items[index];
       status = { ...status, state: "playing", itemTitle: item.title };
       const started = Date.now();
+      current.position = { index, offsetSec, started };
       const result = await playItem(current, item, offsetSec);
       if (current.stopped) break;
 
@@ -94,28 +110,50 @@ export function startPlayout({ getPlan, publishUrl, ffmpegPath = "ffmpeg" }) {
         failuresInRow = 0;
       }
       offsetSec = 0;
+      if (!plan.loop && index === items.length - 1) {
+        // A break has played everything once: hand back to whatever comes next.
+        current.finished = true;
+        status = IDLE;
+        plan.onFinished?.();
+        tick();
+        return;
+      }
       index = (index + 1) % items.length;
     }
+  }
+
+  // Remembers where a resumable plan (the fill playlist) was, so it carries on from there.
+  function rememberPosition(current) {
+    const { plan, position } = current;
+    if (!plan.resumeKey || !position) return;
+    const item = plan.items[position.index];
+    let offsetSec = Math.floor(position.offsetSec + (Date.now() - position.started) / 1000);
+    let index = position.index;
+    if (item && item.durationMinutes > 0 && offsetSec >= item.durationMinutes * 60) {
+      index = (index + 1) % plan.items.length;
+      offsetSec = 0;
+    }
+    positions.set(plan.resumeKey, { index, offsetSec });
   }
 
   function stop() {
     if (!job) return;
     job.stopped = true;
+    if (!job.finished) rememberPosition(job);
     job.child?.kill("SIGTERM");
     job = null;
-    status = { state: "idle", slotId: null, slotTitle: null, playlistName: null, itemTitle: null, error: null };
+    status = IDLE;
   }
 
   function tick() {
     const plan = getPlan();
-    // Restart when the slot changes or the playlist is edited mid-slot.
-    const key = plan ? `${plan.slot.id}:${plan.playlist.id}:${plan.playlist.updatedAt}` : null;
-    if (job?.key === key) return;
+    const key = plan?.key ?? null;
+    if (job?.key === key && !job.finished) return;
     stop();
     if (!plan) return;
 
-    job = { key, child: null, stopped: false };
-    status = { state: "starting", slotId: plan.slot.id, slotTitle: plan.slot.title, playlistName: plan.playlist.name, itemTitle: null, error: null };
+    job = { key, plan, child: null, stopped: false, finished: false, position: null };
+    status = { ...IDLE, state: "starting", kind: plan.kind, slotId: plan.id, slotTitle: plan.title, playlistName: plan.playlistName };
     void run(job, plan);
   }
 

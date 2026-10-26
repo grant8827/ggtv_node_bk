@@ -58,6 +58,8 @@ function defaultDb() {
     schedule: [],
     playlists: [],
     media: [],
+    // What the server plays on its own when nobody is live from the studio.
+    channel: { fillPlaylistId: "" },
   };
 }
 
@@ -81,7 +83,7 @@ async function loadDb() {
   const fallback = defaultDb();
   const stored = await readStored();
   if (!stored) return fallback;
-  return { ...fallback, ...stored, live: { ...fallback.live, ...stored.live } };
+  return { ...fallback, ...stored, live: { ...fallback.live, ...stored.live }, channel: { ...fallback.channel, ...stored.channel } };
 }
 
 async function writeStored() {
@@ -247,18 +249,62 @@ async function login(request, response) {
 
 const mediaStore = createMediaStore({ dir: mediaDir, maxUploadBytes, HttpError });
 
-function playoutPlan() {
-  if (db.live.isLive) return null;
-  const now = new Date().toISOString();
-  const slot = db.schedule.find((entry) => entry.kind === "playlist" && entry.start <= now && entry.end > now);
-  const playlist = slot && db.playlists.find((item) => item.id === slot.playlistId);
-  // Links and uploaded videos can play from here; files kept in a studio browser can't.
-  const items = (playlist?.items ?? []).flatMap((item) => {
+// Links and uploaded videos can play from the server; files kept in a studio browser can't.
+function playableItems(items) {
+  return (items ?? []).flatMap((item) => {
     if (item.url) return [{ ...item, input: item.url }];
     const media = item.mediaId && db.media.find((entry) => entry.id === item.mediaId);
     return media ? [{ ...item, input: mediaStore.pathOf(media), isLocal: true }] : [];
   });
-  return items.length ? { slot, playlist: { ...playlist, items } } : null;
+}
+
+// Breaks that have played all their videos, and the one playing now (it runs to the end).
+const finishedBreaks = new Set();
+let activeBreakId = null;
+// A short break must not be missed between checks, so it may start up to a minute late.
+const breakGraceMs = 60000;
+const breakIsDue = (entry, now) => entry.start <= now && Date.now() < Math.max(Date.parse(entry.end), Date.parse(entry.start) + breakGraceMs);
+
+// What the server channel plays when nobody is live from the studio, in priority order:
+// a due break (played once), a scheduled playlist slot, then the channel fill playlist.
+// Live-show slots need the studio, so the fill keeps playing through them.
+function playoutPlan() {
+  if (db.live.isLive) return null;
+  const now = new Date().toISOString();
+
+  const running = activeBreakId && !finishedBreaks.has(activeBreakId) && db.schedule.find((entry) => entry.id === activeBreakId);
+  const due = running || db.schedule.find((entry) => entry.kind === "break" && !finishedBreaks.has(entry.id) && breakIsDue(entry, now));
+  const breakItems = due ? playableItems(due.items) : [];
+  if (due && breakItems.length) {
+    activeBreakId = due.id;
+    return {
+      key: `break:${due.id}`, kind: "break", id: due.id, title: due.title, playlistName: "Break", items: breakItems, loop: false,
+      onFinished: () => {
+        finishedBreaks.add(due.id);
+        activeBreakId = null;
+      },
+    };
+  }
+
+  const slot = db.schedule.find((entry) => entry.kind === "playlist" && entry.start <= now && entry.end > now);
+  const slotPlaylist = slot && db.playlists.find((item) => item.id === slot.playlistId);
+  const slotItems = playableItems(slotPlaylist?.items);
+  if (slotItems.length) {
+    return {
+      key: `slot:${slot.id}:${slotPlaylist.updatedAt}`, kind: "slot", id: slot.id, title: slot.title, playlistName: slotPlaylist.name,
+      items: slotItems, loop: true, alignTo: slot.start,
+    };
+  }
+
+  const fill = db.channel.fillPlaylistId && db.playlists.find((item) => item.id === db.channel.fillPlaylistId);
+  const fillItems = playableItems(fill?.items);
+  if (fillItems.length) {
+    return {
+      key: `fill:${fill.id}:${fill.updatedAt}`, kind: "fill", id: fill.id, title: fill.name, playlistName: fill.name,
+      items: fillItems, loop: true, resumeKey: `fill:${fill.id}`,
+    };
+  }
+  return null;
 }
 
 const playout = startPlayout({
@@ -542,6 +588,17 @@ const routes = [
     sendJson(response, 200, { ok: true });
   }],
 
+  ["GET", "/api/studio/channel", true, (request, response) => sendJson(response, 200, db.channel)],
+  ["PUT", "/api/studio/channel", true, async (request, response) => {
+    const body = await readJson(request);
+    const fillPlaylistId = typeof body.fillPlaylistId === "string" ? body.fillPlaylistId : "";
+    if (fillPlaylistId && !db.playlists.some((playlist) => playlist.id === fillPlaylistId)) throw new HttpError(400, "That playlist doesn't exist");
+    db.channel = { ...db.channel, fillPlaylistId };
+    await saveDb();
+    playout.refresh();
+    sendJson(response, 200, db.channel);
+  }],
+
   ["GET", "/api/studio/playlists", true, (request, response) => sendJson(response, 200, db.playlists)],
   ["POST", "/api/studio/playlists", true, async (request, response) => {
     const playlist = { id: randomUUID(), ...playlistInput(await readJson(request)), updatedAt: new Date().toISOString() };
@@ -559,6 +616,9 @@ const routes = [
     const index = findIndex(db.playlists, params[0], "Playlist");
     if (db.schedule.some((entry) => entry.playlistId === params[0])) {
       throw new HttpError(409, "This playlist is used in the schedule. Remove those slots first.");
+    }
+    if (db.channel.fillPlaylistId === params[0]) {
+      throw new HttpError(409, "This playlist is the channel's off-air fill. Choose another fill on the Schedule tab first.");
     }
     db.playlists.splice(index, 1);
     await saveDb();
