@@ -25,10 +25,8 @@ export function attachSwitcherOutput(server, { path, authorize, publishUrl, ffmp
 
   server.on("upgrade", (request, socket, head) => {
     const { pathname } = new URL(request.url, "http://localhost");
-    if (pathname !== path) {
-      socket.destroy();
-      return;
-    }
+    // Other paths belong to other handlers; server.js closes any nobody claims.
+    if (pathname !== path) return;
     const denied = authorize(request);
     if (denied) {
       socket.end(`HTTP/1.1 ${denied}\r\nConnection: close\r\n\r\n`);

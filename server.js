@@ -1,13 +1,16 @@
 import { createServer } from "node:http";
-import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, randomUUID, scrypt, timingSafeEqual } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { startPlayout } from "./playout.js";
 import { attachSwitcherOutput } from "./switcherOutput.js";
 import { createMediaStore } from "./media.js";
+import { PLATFORMS, startRestreams } from "./restream.js";
+import { attachGuestRoom } from "./guestRoom.js";
 
 const port = Number(process.env.PORT) || 3001;
 const appDir = path.dirname(fileURLToPath(import.meta.url));
@@ -29,11 +32,9 @@ const onRailway = Boolean(process.env.RAILWAY_ENVIRONMENT_NAME);
 const secureCookie = process.env.NODE_ENV === "production" || onRailway;
 
 const studioUser = process.env.STUDIO_USERNAME || "admin";
-let studioPassword = process.env.STUDIO_PASSWORD;
-if (!studioPassword) {
-  studioPassword = randomBytes(9).toString("base64url");
-  console.warn(`STUDIO_PASSWORD is not set. Temporary studio login for this run: ${studioUser} / ${studioPassword}`);
-}
+const configuredStudioPassword = process.env.STUDIO_PASSWORD;
+const studioPassword = configuredStudioPassword || randomBytes(9).toString("base64url");
+const scryptAsync = promisify(scrypt);
 
 const sessionCookie = "ggtv_session";
 const sessionTtlMs = 12 * 60 * 60 * 1000;
@@ -43,6 +44,46 @@ const maxLoginFailures = 5;
 const loginLockMs = 15 * 60 * 1000;
 
 // ---------- storage ----------
+
+async function hashPassword(password) {
+  const salt = randomBytes(16);
+  const derivedKey = await scryptAsync(password, salt, 64);
+  return `scrypt$${salt.toString("base64url")}$${derivedKey.toString("base64url")}`;
+}
+
+async function initializeUsers() {
+  if (!pool) {
+    if (!configuredStudioPassword) {
+      console.warn(`STUDIO_PASSWORD is not set. Temporary studio login for this run: ${studioUser} / ${studioPassword}`);
+    }
+    return;
+  }
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id uuid PRIMARY KEY,
+      username varchar(100) NOT NULL UNIQUE,
+      password_hash text NOT NULL,
+      role varchar(20) NOT NULL DEFAULT 'user' CHECK (role IN ('admin', 'user')),
+      is_active boolean NOT NULL DEFAULT true,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now()
+    )
+  `);
+
+  const passwordHash = await hashPassword(studioPassword);
+  const result = await pool.query(
+    `INSERT INTO users (id, username, password_hash, role)
+     VALUES ($1, $2, $3, 'admin')
+     ON CONFLICT (username) DO NOTHING`,
+    [randomUUID(), studioUser, passwordHash],
+  );
+  if (result.rowCount && !configuredStudioPassword) {
+    console.warn(`STUDIO_PASSWORD is not set. Initial admin login: ${studioUser} / ${studioPassword}`);
+  }
+}
+
+await initializeUsers();
 
 function defaultDb() {
   return {
@@ -60,6 +101,10 @@ function defaultDb() {
     media: [],
     // What the server plays on its own when nobody is live from the studio.
     channel: { fillPlaylistId: "" },
+    // YouTube / Facebook stream settings, from each platform's live dashboard.
+    restream: Object.fromEntries(Object.entries(PLATFORMS).map(([id, platform]) => [id, { serverUrl: platform.defaultServerUrl, streamKey: "" }])),
+    // Guest invite links: { id, name, token, createdAt }. Anyone with the link can join as that guest.
+    guests: [],
   };
 }
 
@@ -83,7 +128,13 @@ async function loadDb() {
   const fallback = defaultDb();
   const stored = await readStored();
   if (!stored) return fallback;
-  return { ...fallback, ...stored, live: { ...fallback.live, ...stored.live }, channel: { ...fallback.channel, ...stored.channel } };
+  return {
+    ...fallback,
+    ...stored,
+    live: { ...fallback.live, ...stored.live },
+    channel: { ...fallback.channel, ...stored.channel },
+    restream: Object.fromEntries(Object.keys(PLATFORMS).map((id) => [id, { ...fallback.restream[id], ...stored.restream?.[id] }])),
+  };
 }
 
 async function writeStored() {
@@ -207,10 +258,32 @@ function digest(value) {
   return createHash("sha256").update(String(value)).digest();
 }
 
-function credentialsMatch(username, password) {
+function configuredCredentialsMatch(username, password) {
   const userOk = timingSafeEqual(digest(username), digest(studioUser));
   const passwordOk = timingSafeEqual(digest(password), digest(studioPassword));
   return userOk && passwordOk;
+}
+
+async function passwordMatches(password, encodedHash) {
+  const [algorithm, saltText, hashText] = String(encodedHash).split("$");
+  if (algorithm !== "scrypt" || !saltText || !hashText) return false;
+  try {
+    const expected = Buffer.from(hashText, "base64url");
+    const actual = await scryptAsync(String(password), Buffer.from(saltText, "base64url"), expected.length);
+    return expected.length === actual.length && timingSafeEqual(expected, actual);
+  } catch {
+    return false;
+  }
+}
+
+async function authenticatedUser(username, password) {
+  if (!pool) return configuredCredentialsMatch(username, password) ? studioUser : null;
+  const { rows } = await pool.query(
+    "SELECT username, password_hash FROM users WHERE username = $1 AND is_active = true LIMIT 1",
+    [String(username)],
+  );
+  const user = rows[0];
+  return user && await passwordMatches(password, user.password_hash) ? user.username : null;
 }
 
 function currentSession(request) {
@@ -233,7 +306,8 @@ async function login(request, response) {
   }
 
   const body = await readJson(request);
-  if (!credentialsMatch(body.username ?? "", body.password ?? "")) {
+  const user = await authenticatedUser(body.username ?? "", body.password ?? "");
+  if (!user) {
     const next = failures && failures.until > Date.now() ? failures.count + 1 : 1;
     loginFailures.set(ip, { count: next, until: Date.now() + loginLockMs });
     throw new HttpError(401, "Incorrect username or password");
@@ -241,8 +315,8 @@ async function login(request, response) {
 
   loginFailures.delete(ip);
   const token = randomBytes(32).toString("base64url");
-  sessions.set(token, { user: studioUser, expiresAt: Date.now() + sessionTtlMs });
-  sendJson(response, 200, { user: studioUser }, { "Set-Cookie": cookieHeader(token, sessionTtlMs / 1000) });
+  sessions.set(token, { user, expiresAt: Date.now() + sessionTtlMs });
+  sendJson(response, 200, { user }, { "Set-Cookie": cookieHeader(token, sessionTtlMs / 1000) });
 }
 
 // ---------- views ----------
@@ -329,6 +403,43 @@ function publicLive() {
   };
 }
 
+// Pulls the studio's program output back out of SRS and sends it on to YouTube / Facebook.
+const restreams = startRestreams({
+  sourceUrl: () => `${playoutRtmpUrl}/${db.live.streamName}`,
+  ffmpegPath: process.env.FFMPEG_PATH || "ffmpeg",
+});
+
+function restreamView() {
+  return Object.fromEntries(Object.entries(PLATFORMS).map(([id, platform]) => {
+    const { serverUrl, streamKey } = db.restream[id];
+    // The stream key is write-only; the studio only sees its last few characters.
+    return [id, { name: platform.name, serverUrl, streamKeySet: Boolean(streamKey), streamKeyHint: streamKey.slice(-4), ...restreams.status(id) }];
+  }));
+}
+
+function findInvite(token) {
+  return token ? db.guests.find((invite) => invite.token === token) ?? null : null;
+}
+
+function guestInvites() {
+  const connected = guestRoom.connectedInvites();
+  return db.guests.map((invite) => ({ ...invite, connected: connected.has(invite.id) }));
+}
+
+// Browsers find a direct path to each other with STUN. Some networks (strict company or hotel
+// Wi-Fi, some mobile carriers) need a TURN relay as well, configured with these settings.
+function iceServers() {
+  const servers = [{ urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] }];
+  const turnUrls = (process.env.TURN_URLS || "").split(",").map((url) => url.trim()).filter(Boolean);
+  if (turnUrls.length) servers.push({ urls: turnUrls, username: process.env.TURN_USERNAME || "", credential: process.env.TURN_CREDENTIAL || "" });
+  return servers;
+}
+
+function restreamPlatform(id) {
+  if (!Object.hasOwn(PLATFORMS, id)) throw new HttpError(404, "Unknown platform");
+  return id;
+}
+
 function studioLive() {
   return {
     ...publicLive(),
@@ -337,6 +448,7 @@ function studioLive() {
     rtmpUrl,
     playout: playout.status(),
     switcherOutput: switcherOutput.status(),
+    restream: restreamView(),
   };
 }
 
@@ -553,6 +665,51 @@ const routes = [
     sendJson(response, 200, studioLive());
   }],
 
+  ["PUT", /^\/api\/studio\/restream\/(\w+)$/, true, async (request, response, { params }) => {
+    const id = restreamPlatform(params[0]);
+    const body = await readJson(request);
+    const serverUrl = text(body.serverUrl, "Server URL", { min: 1, max: 300 });
+    if (!/^rtmps?:\/\/[^\s/]+/i.test(serverUrl)) throw new HttpError(400, "Server URL must start with rtmp:// or rtmps://");
+    // Leaving the key blank keeps the saved one.
+    const streamKey = text(body.streamKey, "Stream key", { max: 300 }) || db.restream[id].streamKey;
+    if (/\s/.test(streamKey)) throw new HttpError(400, "Stream key can't contain spaces");
+    db.restream[id] = { serverUrl, streamKey };
+    await saveDb();
+    sendJson(response, 200, studioLive());
+  }],
+  ["POST", /^\/api\/studio\/restream\/(\w+)\/start$/, true, (request, response, { params }) => {
+    const id = restreamPlatform(params[0]);
+    const settings = db.restream[id];
+    if (!settings.streamKey) throw new HttpError(400, `Add your ${PLATFORMS[id].name} stream key in settings first`);
+    restreams.start(id, settings);
+    sendJson(response, 200, studioLive());
+  }],
+  ["POST", /^\/api\/studio\/restream\/(\w+)\/stop$/, true, (request, response, { params }) => {
+    restreams.stop(restreamPlatform(params[0]));
+    sendJson(response, 200, studioLive());
+  }],
+
+  ["GET", "/api/studio/guests", true, (request, response) => sendJson(response, 200, guestInvites())],
+  ["POST", "/api/studio/guests", true, async (request, response) => {
+    const body = await readJson(request);
+    if (db.guests.length >= 50) throw new HttpError(400, "Delete some old invites first (50 at most)");
+    db.guests.push({ id: randomUUID(), name: text(body.name, "Guest name", { min: 1, max: 60 }), token: randomBytes(18).toString("base64url"), createdAt: new Date().toISOString() });
+    await saveDb();
+    sendJson(response, 201, guestInvites());
+  }],
+  ["DELETE", /^\/api\/studio\/guests\/([\w-]+)$/, true, async (request, response, { params }) => {
+    db.guests.splice(findIndex(db.guests, params[0], "Invite"), 1);
+    await saveDb();
+    guestRoom.revoke(params[0]);
+    sendJson(response, 200, guestInvites());
+  }],
+  // The guest page reads its own invite to greet the guest by name.
+  ["GET", /^\/api\/guest\/([\w-]{16,64})$/, false, (request, response, { params }) => {
+    const invite = findInvite(params[0]);
+    if (!invite) throw new HttpError(404, "This invite link isn't valid any more. Ask the studio for a new one.");
+    sendJson(response, 200, { name: invite.name });
+  }],
+
   ["GET", "/api/studio/schedule", true, (request, response) => sendJson(response, 200, scheduleView(db.schedule))],
   ["POST", "/api/studio/schedule", true, async (request, response) => {
     const entry = { id: randomUUID(), ...scheduleInput(await readJson(request)) };
@@ -671,24 +828,40 @@ const server = createServer(async (request, response) => {
 });
 
 // The browser switcher streams its program output here; it publishes as the live encoder.
+// Studio WebSockets carry the session cookie, which browsers also send on cross-site handshakes,
+// so they must come from our own origin.
+function authorizeStudioSocket(request) {
+  const session = currentSession(request);
+  if (!session) return "401 Unauthorized";
+  let originHost = null;
+  try {
+    originHost = new URL(request.headers.origin).host;
+  } catch {
+    return "403 Forbidden";
+  }
+  if (originHost !== request.headers.host) return "403 Forbidden";
+  request.studioUser = session.user;
+  return null;
+}
+
 const switcherOutput = attachSwitcherOutput(server, {
   path: "/api/studio/switcher/output",
-  authorize(request) {
-    const session = currentSession(request);
-    if (!session) return "401 Unauthorized";
-    // Cookies ride along on cross-site WebSocket handshakes, so require our own origin.
-    let originHost = null;
-    try {
-      originHost = new URL(request.headers.origin).host;
-    } catch {
-      return "403 Forbidden";
-    }
-    if (originHost !== request.headers.host) return "403 Forbidden";
-    request.studioUser = session.user;
-    return null;
-  },
+  authorize: authorizeStudioSocket,
   publishUrl: () => `${playoutRtmpUrl}/${db.live.streamName}?key=${db.live.streamKey}`,
   ffmpegPath: process.env.FFMPEG_PATH || "ffmpeg",
+});
+
+const guestRoom = attachGuestRoom(server, {
+  studioPath: "/api/studio/guests/signal",
+  guestPath: "/api/guest/signal",
+  authorizeStudio: authorizeStudioSocket,
+  findInvite,
+  iceServers,
+});
+
+const socketPaths = new Set(["/api/studio/switcher/output", "/api/studio/guests/signal", "/api/guest/signal"]);
+server.on("upgrade", (request, socket) => {
+  if (!socketPaths.has(new URL(request.url, "http://localhost").pathname)) socket.destroy();
 });
 
 server.listen(port, () => {
@@ -699,6 +872,8 @@ for (const signal of ["SIGTERM", "SIGINT"]) {
   process.on(signal, () => {
     playout.shutdown();
     switcherOutput.shutdown();
+    restreams.shutdown();
+    guestRoom.shutdown();
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 3000).unref();
   });
