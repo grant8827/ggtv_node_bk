@@ -11,6 +11,7 @@ import { attachSwitcherOutput } from "./switcherOutput.js";
 import { createMediaStore } from "./media.js";
 import { PLATFORMS, startRestreams } from "./restream.js";
 import { attachGuestRoom } from "./guestRoom.js";
+import { FREQUENCIES, firstOverlap, occurrences, seriesFinished, validTimeZone } from "./breakRepeat.js";
 
 const port = Number(process.env.PORT) || 3001;
 const appDir = path.dirname(fileURLToPath(import.meta.url));
@@ -339,6 +340,15 @@ let activeBreakId = null;
 const breakGraceMs = 60000;
 const breakIsDue = (entry, now) => entry.start <= now && Date.now() < Math.max(Date.parse(entry.end), Date.parse(entry.start) + breakGraceMs);
 
+// Each repeat of a break is its own occurrence, with an id made from the break and its start time,
+// so every repeat plays once.
+function breakOccurrences(fromMs, toMs) {
+  return db.schedule
+    .filter((entry) => entry.kind === "break")
+    .flatMap((entry) => occurrences(entry, fromMs, toMs).map((time) => ({ ...entry, ...time, id: `${entry.id}@${time.start}`, seriesId: entry.id })))
+    .sort((a, b) => a.start.localeCompare(b.start));
+}
+
 // What the server channel plays when nobody is live from the studio, in priority order:
 // a due break (played once), a scheduled playlist slot, then the channel fill playlist.
 // Live-show slots need the studio, so the fill keeps playing through them.
@@ -346,8 +356,9 @@ function playoutPlan() {
   if (db.live.isLive) return null;
   const now = new Date().toISOString();
 
-  const running = activeBreakId && !finishedBreaks.has(activeBreakId) && db.schedule.find((entry) => entry.id === activeBreakId);
-  const due = running || db.schedule.find((entry) => entry.kind === "break" && !finishedBreaks.has(entry.id) && breakIsDue(entry, now));
+  const breaks = breakOccurrences(Date.now() - 86400000, Date.now() + breakGraceMs);
+  const running = activeBreakId && !finishedBreaks.has(activeBreakId) && breaks.find((entry) => entry.id === activeBreakId);
+  const due = running || breaks.find((entry) => !finishedBreaks.has(entry.id) && breakIsDue(entry, now));
   const breakItems = due ? playableItems(due.items) : [];
   if (due && breakItems.length) {
     activeBreakId = due.id;
@@ -361,7 +372,9 @@ function playoutPlan() {
   }
 
   const slot = db.schedule.find((entry) => entry.kind === "playlist" && entry.start <= now && entry.end > now);
-  const slotPlaylist = slot && db.playlists.find((item) => item.id === slot.playlistId);
+  const slotPlaylist = slot && (slot.items
+    ? { name: slot.title, items: slot.items, updatedAt: slot.updatedAt ?? "" }
+    : db.playlists.find((item) => item.id === slot.playlistId));
   const slotItems = playableItems(slotPlaylist?.items);
   if (slotItems.length) {
     return {
@@ -452,10 +465,39 @@ function studioLive() {
   };
 }
 
-function scheduleView(entries) {
+// The studio sees each repeating break once, with its repeats from a day ago to two days ahead
+// (the studio's switcher plays them from that list).
+function scheduleView(entries, { withOccurrences = false } = {}) {
+  const nowMs = Date.now();
   return [...entries]
     .sort((a, b) => a.start.localeCompare(b.start))
-    .map((entry) => ({ ...entry, playlistName: db.playlists.find((playlist) => playlist.id === entry.playlistId)?.name ?? null }));
+    .map((entry) => ({
+      ...entry,
+      playlistName: db.playlists.find((playlist) => playlist.id === entry.playlistId)?.name ?? null,
+      ...(withOccurrences && entry.repeat && entry.repeat.frequency !== "once"
+        ? { occurrences: occurrences(entry, nowMs - 86400000, nowMs + 2 * 86400000, 500), finished: seriesFinished(entry, nowMs) }
+        : {}),
+    }));
+}
+
+// How often a break plays. Days and times are in the studio's time zone.
+function repeatInput(raw) {
+  const frequency = FREQUENCIES.includes(raw?.frequency) ? raw.frequency : "once";
+  if (frequency === "once") return null;
+  const timeZone = typeof raw.timeZone === "string" && validTimeZone(raw.timeZone) ? raw.timeZone : "UTC";
+  const weekdays = frequency === "weekly"
+    ? [...new Set((Array.isArray(raw.weekdays) ? raw.weekdays : []).map(Number).filter((day) => Number.isInteger(day) && day >= 0 && day <= 6))].sort()
+    : [];
+  if (frequency === "weekly" && !weekdays.length) throw new HttpError(400, "Choose at least one day of the week");
+  const everyMinutes = Number(raw.everyMinutes ?? 0);
+  if (!Number.isInteger(everyMinutes) || everyMinutes < 0 || everyMinutes > 720 || (everyMinutes > 0 && everyMinutes < 5)) {
+    throw new HttpError(400, "Repeat during the day must be every 5 to 720 minutes");
+  }
+  const untilTime = typeof raw.untilTime === "string" && /^([01]\d|2[0-3]):[0-5]\d$/.test(raw.untilTime) ? raw.untilTime : null;
+  if (everyMinutes && !untilTime) throw new HttpError(400, "Choose the time the repeats stop each day");
+  const endDate = typeof raw.endDate === "string" && raw.endDate ? raw.endDate : null;
+  if (endDate && (!/^\d{4}-\d{2}-\d{2}$/.test(endDate) || Number.isNaN(Date.parse(endDate)))) throw new HttpError(400, "The end date must be a valid date");
+  return { frequency, weekdays, everyMinutes, untilTime: everyMinutes ? untilTime : null, endDate, timeZone };
 }
 
 // ---------- schedule & playlists ----------
@@ -500,6 +542,7 @@ function scheduleInput(body, ignoreId) {
   let end;
   let playlistId = null;
   let items;
+  let repeat = null;
   if (kind === "break") {
     // A break plays its videos once; its end is when they're expected to finish.
     items = itemsInput(body.items, 50);
@@ -507,10 +550,19 @@ function scheduleInput(body, ignoreId) {
     // Unknown lengths (0) still reserve a minute so the break has a window to start in.
     const totalMinutes = items.reduce((sum, item) => sum + item.durationMinutes, 0) || 1;
     end = new Date(Date.parse(start) + totalMinutes * 60000).toISOString();
+    repeat = repeatInput(body.repeat);
+    if (repeat?.everyMinutes && repeat.everyMinutes < totalMinutes) {
+      throw new HttpError(400, `The break is ${Math.ceil(totalMinutes)} minutes long, so it can't repeat every ${repeat.everyMinutes} minutes`);
+    }
+    if (repeat?.endDate && repeat.endDate < start.slice(0, 10)) throw new HttpError(400, "The end date is before the first break");
   } else {
     end = isoDate(body.end, "End time");
     if (end <= start) throw new HttpError(400, "End time must be after the start time");
-    if (kind === "playlist") {
+    if (kind === "playlist" && body.source === "videos") {
+      // Videos picked for this slot alone (links or uploads), looping until the slot ends.
+      items = itemsInput(body.items, 200);
+      if (!items.length) throw new HttpError(400, "Add at least one video to this slot");
+    } else if (kind === "playlist") {
       playlistId = typeof body.playlistId === "string" ? body.playlistId : "";
       if (!db.playlists.some((playlist) => playlist.id === playlistId)) throw new HttpError(400, "Choose a playlist for this slot");
     }
@@ -518,10 +570,27 @@ function scheduleInput(body, ignoreId) {
 
   // Breaks interrupt shows, so they may sit inside a show; they just can't overlap each other.
   const isBreak = (entry) => entry.kind === "break";
-  const clash = db.schedule.find((entry) => entry.id !== ignoreId && isBreak(entry) === (kind === "break") && entry.start < end && start < entry.end);
-  if (clash) throw new HttpError(409, `Overlaps with "${clash.title}"`);
+  if (kind === "break") {
+    // Repeating breaks are compared over the next two months.
+    const candidate = { start, end, repeat };
+    const fromMs = Math.max(Date.now(), Date.parse(start)) - 86400000;
+    for (const entry of db.schedule) {
+      if (entry.id === ignoreId || !isBreak(entry)) continue;
+      const overlap = firstOverlap(candidate, entry, fromMs, fromMs + 62 * 86400000);
+      if (overlap) {
+        const when = new Date(overlap.start).toLocaleString("en-US", { timeZone: repeat?.timeZone ?? entry.repeat?.timeZone ?? "UTC", dateStyle: "medium", timeStyle: "short" });
+        throw new HttpError(409, `Overlaps with the break "${entry.title}" (${when})`);
+      }
+    }
+  } else {
+    const clash = db.schedule.find((entry) => entry.id !== ignoreId && !isBreak(entry) && entry.start < end && start < entry.end);
+    if (clash) throw new HttpError(409, `Overlaps with "${clash.title}"`);
+  }
 
-  return { title, description, start, end, kind, playlistId, ...(items ? { items } : {}) };
+  return {
+    title, description, start, end, kind, playlistId, updatedAt: new Date().toISOString(),
+    ...(items ? { items } : {}), ...(kind === "break" ? { repeat } : {}),
+  };
 }
 
 function playlistInput(body) {
@@ -534,7 +603,7 @@ function mediaUsers(mediaId) {
   const uses = (items) => (items ?? []).some((item) => item.mediaId === mediaId);
   return [
     ...db.playlists.filter((playlist) => uses(playlist.items)).map((playlist) => playlist.name),
-    ...db.schedule.filter((entry) => uses(entry.items)).map((entry) => `break "${entry.title}"`),
+    ...db.schedule.filter((entry) => uses(entry.items)).map((entry) => `${entry.kind === "break" ? "break" : "slot"} "${entry.title}"`),
   ];
 }
 
@@ -710,7 +779,7 @@ const routes = [
     sendJson(response, 200, { name: invite.name });
   }],
 
-  ["GET", "/api/studio/schedule", true, (request, response) => sendJson(response, 200, scheduleView(db.schedule))],
+  ["GET", "/api/studio/schedule", true, (request, response) => sendJson(response, 200, scheduleView(db.schedule, { withOccurrences: true }))],
   ["POST", "/api/studio/schedule", true, async (request, response) => {
     const entry = { id: randomUUID(), ...scheduleInput(await readJson(request)) };
     db.schedule.push(entry);
