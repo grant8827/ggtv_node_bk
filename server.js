@@ -394,8 +394,17 @@ function playoutPlan() {
   return null;
 }
 
+// When the next break the server will play starts (ms), for the countdown shown before it.
+function nextBreakAt() {
+  const now = Date.now();
+  const next = breakOccurrences(now, now + 86400000)
+    .find((entry) => !finishedBreaks.has(entry.id) && Date.parse(entry.start) > now && playableItems(entry.items).length);
+  return next ? Date.parse(next.start) : null;
+}
+
 const playout = startPlayout({
   getPlan: playoutPlan,
+  nextBreakAt,
   publishUrl: () => `${playoutRtmpUrl}/${playoutStream}?key=${db.live.streamKey}`,
   ffmpegPath: process.env.FFMPEG_PATH || "ffmpeg",
 });

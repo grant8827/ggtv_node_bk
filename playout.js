@@ -1,8 +1,16 @@
 import { spawn } from "node:child_process";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const tickMs = 1000;
 const retryDelayMs = 10_000;
 const quickFailSeconds = 5;
+
+// The "BK:10" … "BK:01" countdown shown before a break: one image per second, played as a
+// 1 fps image sequence over the top-right of the picture. The last image is repeated because the
+// final frame of a sequence gets no screen time.
+const countdownSeconds = 10;
+const countdownImages = join(dirname(fileURLToPath(import.meta.url)), "countdown", "bk-%02d.png");
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -20,8 +28,16 @@ function startPosition(items, elapsedSec) {
   return { index: 0, offsetSec: 0 };
 }
 
-function ffmpegArgs(item, offsetSec, output) {
+// `breakInSec`: seconds from now until a break starts, if one is coming. When the countdown falls
+// within this item, it is drawn into the picture so every viewer sees it in step with the video.
+function ffmpegArgs(item, offsetSec, output, breakInSec = null) {
   const limit = item.durationMinutes > 0 ? Math.max(1, item.durationMinutes * 60 - offsetSec) : null;
+  const countdownAt = breakInSec === null ? null : breakInSec - countdownSeconds;
+  const countdown = countdownAt !== null && countdownAt > -countdownSeconds && (limit === null || countdownAt < limit);
+  // Scale every item to one format so the outgoing stream stays consistent between items.
+  const video = countdown
+    ? ["-filter_complex", "[0:v]scale=-2:720,fps=30[base];[base][1:v]overlay=x=W-w-32:y=32:eof_action=pass:format=auto[v]", "-map", "[v]", "-map", "0:a?"]
+    : ["-vf", "scale=-2:720,fps=30"];
   return [
     "-hide_banner", "-loglevel", "error", "-nostdin",
     "-re",
@@ -29,9 +45,12 @@ function ffmpegArgs(item, offsetSec, output) {
     "-protocol_whitelist", item.isLocal ? "file" : "http,https,tcp,tls,crypto",
     ...(offsetSec > 0 ? ["-ss", String(offsetSec)] : []),
     "-i", item.input ?? item.url,
+    // The countdown starts `countdownAt` seconds in, or part-way through if the break is closer.
+    ...(countdown
+      ? [...(countdownAt >= 0 ? ["-itsoffset", countdownAt.toFixed(2)] : ["-ss", (-countdownAt).toFixed(2)]), "-framerate", "1", "-i", countdownImages]
+      : []),
     ...(limit ? ["-t", String(limit)] : []),
-    // Re-encode every item to one format so the outgoing stream stays consistent between items.
-    "-vf", "scale=-2:720,fps=30",
+    ...video,
     "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency", "-pix_fmt", "yuv420p",
     "-b:v", "2500k", "-maxrate", "2500k", "-bufsize", "5000k",
     "-g", "60", "-keyint_min", "60", "-sc_threshold", "0",
@@ -48,15 +67,19 @@ const IDLE = { state: "idle", kind: null, slotId: null, slotTitle: null, playlis
 //     alignTo?: ISO time  – start where the schedule says we should be by now (scheduled slots)
 //     resumeKey?: string  – carry on from where this was last stopped (the fill playlist)
 //     onFinished?: fn     – called when a non-looping plan (a break) has played every item }
-// A new key replaces whatever is playing.
-export function startPlayout({ getPlan, publishUrl, ffmpegPath = "ffmpeg" }) {
+// A new key replaces whatever is playing. `nextBreakAt` returns when the next break starts (ms), or
+// null, so a countdown can be shown before it.
+export function startPlayout({ getPlan, publishUrl, nextBreakAt = () => null, ffmpegPath = "ffmpeg" }) {
   let job = null;
   let status = IDLE;
   const positions = new Map();
 
   function playItem(current, item, offsetSec) {
     return new Promise((resolve) => {
-      const child = spawn(ffmpegPath, ffmpegArgs(item, offsetSec, publishUrl()), { stdio: ["ignore", "ignore", "pipe"] });
+      // Breaks themselves don't count down to the next break.
+      const breakAt = current.plan.kind === "break" ? null : nextBreakAt();
+      const breakInSec = breakAt === null ? null : (breakAt - Date.now()) / 1000;
+      const child = spawn(ffmpegPath, ffmpegArgs(item, offsetSec, publishUrl(), breakInSec), { stdio: ["ignore", "ignore", "pipe"] });
       current.child = child;
       let stderr = "";
       child.stderr.on("data", (chunk) => {

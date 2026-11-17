@@ -5,5 +5,6 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 COPY server.js playout.js switcherOutput.js media.js restream.js guestRoom.js breakRepeat.js ./
+COPY countdown ./countdown
 ENV NODE_ENV=production
 CMD ["node", "server.js"]
