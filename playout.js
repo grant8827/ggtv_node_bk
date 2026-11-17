@@ -5,6 +5,12 @@ import { fileURLToPath } from "node:url";
 const tickMs = 1000;
 const retryDelayMs = 10_000;
 const quickFailSeconds = 5;
+// A quick failure is retried this many times before moving on: SRS can briefly refuse a new
+// publisher while the previous one is still disconnecting.
+const quickRetries = 3;
+const quickRetryDelayMs = 2000;
+// Pause after the previous ffmpeg has exited, so SRS has released the stream.
+const handoverDelayMs = 1000;
 
 // The "BK:10" … "BK:01" countdown shown before a break: one image per second, played as a
 // 1 fps image sequence over the top-right of the picture. The last image is repeated because the
@@ -73,12 +79,15 @@ export function startPlayout({ getPlan, publishUrl, nextBreakAt = () => null, ff
   let job = null;
   let status = IDLE;
   const positions = new Map();
+  // Resolves once the last stopped ffmpeg has exited; the next plan waits for it.
+  let previousExit = Promise.resolve();
 
   function playItem(current, item, offsetSec) {
     return new Promise((resolve) => {
       // Breaks themselves don't count down to the next break.
       const breakAt = current.plan.kind === "break" ? null : nextBreakAt();
       const breakInSec = breakAt === null ? null : (breakAt - Date.now()) / 1000;
+      current.countdownFor = breakAt;
       const child = spawn(ffmpegPath, ffmpegArgs(item, offsetSec, publishUrl(), breakInSec), { stdio: ["ignore", "ignore", "pipe"] });
       current.child = child;
       let stderr = "";
@@ -108,6 +117,10 @@ export function startPlayout({ getPlan, publishUrl, nextBreakAt = () => null, ff
     let { index, offsetSec } = startOf(plan);
     if (index >= items.length) index = 0;
     let failuresInRow = 0;
+    let retries = 0;
+
+    await previousExit;
+    await sleep(handoverDelayMs);
 
     while (!current.stopped) {
       const item = items[index];
@@ -118,6 +131,20 @@ export function startPlayout({ getPlan, publishUrl, nextBreakAt = () => null, ff
       if (current.stopped) break;
 
       const ranSeconds = (Date.now() - started) / 1000;
+      // Restarted part-way through to add the countdown for a break: carry on from the same spot.
+      if (current.restart) {
+        current.restart = false;
+        offsetSec += Math.floor(ranSeconds);
+        await sleep(handoverDelayMs);
+        continue;
+      }
+      if (!result.ok && ranSeconds < quickFailSeconds && retries < quickRetries) {
+        retries += 1;
+        console.error(`Playout: "${item.title}" failed, retrying: ${result.message}`);
+        await sleep(quickRetryDelayMs);
+        continue;
+      }
+      retries = 0;
       if (!result.ok && ranSeconds < quickFailSeconds) {
         failuresInRow += 1;
         console.error(`Playout: "${item.title}" failed: ${result.message}`);
@@ -163,15 +190,33 @@ export function startPlayout({ getPlan, publishUrl, nextBreakAt = () => null, ff
     if (!job) return;
     job.stopped = true;
     if (!job.finished) rememberPosition(job);
-    job.child?.kill("SIGTERM");
+    const child = job.child;
+    if (child) {
+      previousExit = new Promise((resolve) => child.once("close", resolve));
+      child.kill("SIGTERM");
+    }
     job = null;
     status = IDLE;
+  }
+
+  // A break added (or moved) while an item was already playing: restart the item where it is, with
+  // the countdown, just as the countdown should appear.
+  function ensureCountdown(current) {
+    if (current.plan.kind === "break" || !current.child || current.restart) return;
+    const breakAt = nextBreakAt();
+    if (breakAt === null || breakAt === current.countdownFor) return;
+    if (breakAt - Date.now() > (countdownSeconds + 1) * 1000) return;
+    current.restart = true;
+    current.child.kill("SIGTERM");
   }
 
   function tick() {
     const plan = getPlan();
     const key = plan?.key ?? null;
-    if (job?.key === key && !job.finished) return;
+    if (job?.key === key && !job.finished) {
+      ensureCountdown(job);
+      return;
+    }
     stop();
     if (!plan) return;
 
