@@ -97,6 +97,8 @@ export function startPlayout({ getPlan, publishUrl, nextBreakAt = () => null, ff
   let job = null;
   let status = IDLE;
   const positions = new Map();
+  // The playing playlist's current and next videos, kept for Up next during a break.
+  let lastLineup = [];
   // Resolves once the last stopped ffmpeg has exited; the next plan waits for it.
   let previousExit = Promise.resolve();
 
@@ -142,7 +144,15 @@ export function startPlayout({ getPlan, publishUrl, nextBreakAt = () => null, ff
 
     while (!current.stopped) {
       const item = items[index];
-      const upcoming = upcomingItems(plan, index, Date.now() - offsetSec * 1000);
+      // Up next only lists playlist videos. During a break, it shows the playlist that was
+      // interrupted, from the video that was cut off (when each will start isn't known).
+      let upcoming;
+      if (plan.kind === "break") {
+        upcoming = lastLineup.map((title) => ({ title, start: null }));
+      } else {
+        upcoming = upcomingItems(plan, index, Date.now() - offsetSec * 1000);
+        lastLineup = [item.title, ...upcoming.map((next) => next.title)].slice(0, upcomingCount);
+      }
       status = { ...status, state: "playing", itemTitle: item.title, nextItemTitle: upcoming[0]?.title ?? null, upcoming };
       const started = Date.now();
       current.position = { index, offsetSec, started };
