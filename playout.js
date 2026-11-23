@@ -65,7 +65,25 @@ function ffmpegArgs(item, offsetSec, output, breakInSec = null) {
   ];
 }
 
-const IDLE = { state: "idle", kind: null, slotId: null, slotTitle: null, playlistName: null, itemTitle: null, error: null };
+// The videos after the one at `index` (wrapping round when the plan loops), up to `count`, each
+// with when it should start. A start is only known while every video before it has a set length;
+// after one that plays to its end, it is null.
+const upcomingCount = 6;
+function upcomingItems(plan, index, itemStartedMs, count = upcomingCount) {
+  const { items, loop } = plan;
+  const list = [];
+  let startMs = items[index].durationMinutes > 0 ? itemStartedMs + items[index].durationMinutes * 60000 : null;
+  for (let step = 1; list.length < Math.min(count, loop ? items.length - 1 : items.length); step += 1) {
+    const at = index + step;
+    if (!loop && at >= items.length) break;
+    const item = items[at % items.length];
+    list.push({ title: item.title, start: startMs === null ? null : new Date(startMs).toISOString() });
+    startMs = startMs !== null && item.durationMinutes > 0 ? startMs + item.durationMinutes * 60000 : null;
+  }
+  return list;
+}
+
+const IDLE = { state: "idle", kind: null, slotId: null, slotTitle: null, playlistName: null, itemTitle: null, nextItemTitle: null, upcoming: [], error: null };
 
 // Streams what the channel should show into SRS, one ffmpeg process per item.
 // `getPlan` returns null, or a plan:
@@ -124,7 +142,8 @@ export function startPlayout({ getPlan, publishUrl, nextBreakAt = () => null, ff
 
     while (!current.stopped) {
       const item = items[index];
-      status = { ...status, state: "playing", itemTitle: item.title };
+      const upcoming = upcomingItems(plan, index, Date.now() - offsetSec * 1000);
+      status = { ...status, state: "playing", itemTitle: item.title, nextItemTitle: upcoming[0]?.title ?? null, upcoming };
       const started = Date.now();
       current.position = { index, offsetSec, started };
       const result = await playItem(current, item, offsetSec);
@@ -155,7 +174,7 @@ export function startPlayout({ getPlan, publishUrl, nextBreakAt = () => null, ff
       }
 
       if (failuresInRow >= items.length) {
-        status = { ...status, state: "error", itemTitle: null };
+        status = { ...status, state: "error", itemTitle: null, nextItemTitle: null, upcoming: [] };
         await sleep(retryDelayMs);
         failuresInRow = 0;
       }

@@ -413,6 +413,10 @@ function publicLive() {
   const { isLive, title, description, startedAt, streamName, encoderConnected } = db.live;
   const run = playout.status();
   const source = isLive ? "live" : run.state === "playing" ? "playlist" : "off";
+  // A scheduled show takes over from the playlist, so its videos after that start aren't coming up.
+  const now = new Date().toISOString();
+  const nextShow = db.schedule.filter((entry) => entry.kind !== "break" && entry.start > now).map((entry) => entry.start).sort()[0];
+  const upcoming = (run.upcoming ?? []).filter((item) => !nextShow || (item.start && item.start < nextShow));
   return {
     isLive,
     source,
@@ -420,7 +424,7 @@ function publicLive() {
     description,
     startedAt,
     encoderConnected,
-    nowPlaying: source === "playlist" ? { slotTitle: run.slotTitle, itemTitle: run.itemTitle } : null,
+    nowPlaying: source === "playlist" ? { slotTitle: run.slotTitle, itemTitle: run.itemTitle, nextItemTitle: run.nextItemTitle, upcoming } : null,
     hlsUrl: `${hlsBaseUrl}/${source === "playlist" ? playoutStream : streamName}.m3u8`,
   };
 }
