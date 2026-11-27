@@ -24,10 +24,12 @@ const mediaDir = process.env.MEDIA_DIR || path.join(dataDir, "media");
 const maxUploadBytes = (Number(process.env.MAX_UPLOAD_GB) || 5) * 1e9;
 // With DATABASE_URL set (Railway), studio state lives in Postgres; otherwise in a local JSON file.
 const pool = process.env.DATABASE_URL ? new pg.Pool({ connectionString: process.env.DATABASE_URL }) : null;
-const rtmpUrl = process.env.RTMP_INGEST_URL || "rtmp://localhost:1935/live";
-const hlsBaseUrl = (process.env.HLS_BASE_URL || "http://localhost:8080/live").replace(/\/$/, "");
+// Defaults for the streaming URLs; the studio's Settings page can override the public ones.
+const defaultRtmpUrl = process.env.RTMP_INGEST_URL || "rtmp://localhost:1935/live";
+const defaultHlsBaseUrl = (process.env.HLS_BASE_URL || "http://localhost:8080/live").replace(/\/$/, "");
 // Scheduled playlists are pushed to SRS as their own stream; on Railway use SRS's private address.
-const playoutRtmpUrl = (process.env.PLAYOUT_RTMP_URL || rtmpUrl).replace(/\/$/, "");
+// This is the server's own connection to SRS, so it stays an environment setting.
+const playoutRtmpUrl = (process.env.PLAYOUT_RTMP_URL || defaultRtmpUrl).replace(/\/$/, "");
 const playoutStream = "playout";
 const onRailway = Boolean(process.env.RAILWAY_ENVIRONMENT_NAME);
 const secureCookie = process.env.NODE_ENV === "production" || onRailway;
@@ -102,6 +104,8 @@ function defaultDb() {
     media: [],
     // What the server plays on its own when nobody is live from the studio.
     channel: { fillPlaylistId: "" },
+    // Streaming URL overrides from the Settings page. Blank uses the server's environment default.
+    settings: { hlsBaseUrl: "", rtmpIngestUrl: "" },
     // YouTube / Facebook stream settings, from each platform's live dashboard.
     restream: Object.fromEntries(Object.entries(PLATFORMS).map(([id, platform]) => [id, { serverUrl: platform.defaultServerUrl, streamKey: "" }])),
     // Guest invite links: { id, name, token, createdAt }. Anyone with the link can join as that guest.
@@ -134,6 +138,7 @@ async function loadDb() {
     ...stored,
     live: { ...fallback.live, ...stored.live },
     channel: { ...fallback.channel, ...stored.channel },
+    settings: { ...fallback.settings, ...stored.settings },
     restream: Object.fromEntries(Object.keys(PLATFORMS).map((id) => [id, { ...fallback.restream[id], ...stored.restream?.[id] }])),
   };
 }
@@ -409,6 +414,11 @@ const playout = startPlayout({
   ffmpegPath: process.env.FFMPEG_PATH || "ffmpeg",
 });
 
+// Where viewers and the TV apps play the channel from (…/<stream>.m3u8).
+const hlsBaseUrl = () => db.settings.hlsBaseUrl || defaultHlsBaseUrl;
+// The server address shown to encoders (OBS, vMix).
+const rtmpUrl = () => db.settings.rtmpIngestUrl || defaultRtmpUrl;
+
 function publicLive() {
   const { isLive, title, description, startedAt, streamName, encoderConnected } = db.live;
   const run = playout.status();
@@ -425,7 +435,7 @@ function publicLive() {
     startedAt,
     encoderConnected,
     nowPlaying: source === "playlist" ? { slotTitle: run.slotTitle, itemTitle: run.itemTitle, nextItemTitle: run.nextItemTitle, upcoming } : null,
-    hlsUrl: `${hlsBaseUrl}/${source === "playlist" ? playoutStream : streamName}.m3u8`,
+    hlsUrl: `${hlsBaseUrl()}/${source === "playlist" ? playoutStream : streamName}.m3u8`,
   };
 }
 
@@ -466,12 +476,31 @@ function restreamPlatform(id) {
   return id;
 }
 
+function settingsView() {
+  return {
+    hlsBaseUrl: db.settings.hlsBaseUrl,
+    rtmpIngestUrl: db.settings.rtmpIngestUrl,
+    defaults: { hlsBaseUrl: defaultHlsBaseUrl, rtmpIngestUrl: defaultRtmpUrl },
+    liveHlsUrl: `${hlsBaseUrl()}/${db.live.streamName}.m3u8`,
+    playoutHlsUrl: `${hlsBaseUrl()}/${playoutStream}.m3u8`,
+    streamName: db.live.streamName,
+    live: studioLive(),
+  };
+}
+
+// A blank URL means "use the default"; anything else must be a full URL of the given kind.
+function urlSetting(value, field, pattern, hint) {
+  const url = text(value, field, { max: 300 }).replace(/\/+$/, "");
+  if (url && !pattern.test(url)) throw new HttpError(400, `${field} must start with ${hint}`);
+  return url;
+}
+
 function studioLive() {
   return {
     ...publicLive(),
     streamName: db.live.streamName,
     streamKey: db.live.streamKey,
-    rtmpUrl,
+    rtmpUrl: rtmpUrl(),
     playout: playout.status(),
     switcherOutput: switcherOutput.status(),
     restream: restreamView(),
@@ -740,6 +769,23 @@ const routes = [
     await saveDb();
     playout.refresh();
     sendJson(response, 200, studioLive());
+  }],
+  ["GET", "/api/studio/settings", true, (request, response) => sendJson(response, 200, settingsView())],
+  ["PUT", "/api/studio/settings", true, async (request, response) => {
+    const body = await readJson(request);
+    const hlsBaseUrl = urlSetting(body.hlsBaseUrl, "Playback URL", /^https?:\/\/[^\s/]+\S*$/i, "http:// or https://");
+    const rtmpIngestUrl = urlSetting(body.rtmpIngestUrl, "Encoder server URL", /^rtmps?:\/\/[^\s/]+\S*$/i, "rtmp:// or rtmps://");
+    const streamName = text(body.streamName, "Stream name", { min: 1, max: 64 });
+    if (!/^[\w-]+$/.test(streamName)) throw new HttpError(400, "Stream name can only use letters, numbers, - and _");
+    if (streamName === playoutStream) throw new HttpError(400, `"${playoutStream}" is used by the server's playlists. Choose another stream name.`);
+    if (streamName !== db.live.streamName) {
+      // Encoders on the old name are no longer the channel's encoder.
+      db.live.streamName = streamName;
+      db.live.encoderConnected = false;
+    }
+    db.settings = { hlsBaseUrl, rtmpIngestUrl };
+    await saveDb();
+    sendJson(response, 200, settingsView());
   }],
   ["POST", "/api/studio/live/key", true, async (request, response) => {
     db.live.streamKey = randomBytes(12).toString("hex");
