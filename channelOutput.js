@@ -21,16 +21,41 @@ const encode = [
   "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
 ];
 
-// Re-encodes the source with the logo in the bottom-right corner (the break countdown sits top-right).
-export function relayArgs(source, destination) {
+// Where the logo goes, from the studio's Settings → Logo tab.
+// position: top-left | top-right | bottom-left | bottom-right; size: % of the video width;
+// opacity: 0-100; margin: % of the video width from the edges.
+export const DEFAULT_LOGO = { enabled: true, position: "bottom-right", size: 13, opacity: 85, margin: 2.5 };
+
+function overlayPosition({ position, margin }) {
+  const m = Math.round((1280 * margin) / 100);
+  const x = position.endsWith("left") ? `${m}` : `W-w-${m}`;
+  const y = position.startsWith("top") ? `${m}` : `H-h-${m}`;
+  return `x=${x}:y=${y}`;
+}
+
+// Re-encodes the source with the logo drawn where the studio placed it.
+export function relayArgs(source, destination, logoSettings = DEFAULT_LOGO) {
+  if (!logoSettings.enabled) {
+    return [
+      "-hide_banner", "-loglevel", "error", "-nostdin",
+      "-rw_timeout", "10000000",
+      "-i", source,
+      "-vf", "scale=-2:720,fps=30",
+      "-map", "0:v", "-map", "0:a?",
+      ...encode, "-b:v", "3000k", "-maxrate", "3000k", "-bufsize", "6000k",
+      "-f", "flv", destination,
+    ];
+  }
+  const width = Math.round((1280 * logoSettings.size) / 100);
+  const alpha = (logoSettings.opacity / 100).toFixed(2);
   return [
     "-hide_banner", "-loglevel", "error", "-nostdin",
     "-rw_timeout", "10000000",
     "-i", source,
     "-loop", "1", "-framerate", "1", "-i", logo,
     "-filter_complex",
-    "[1:v]scale=170:-1,format=rgba,colorchannelmixer=aa=0.85[logo];"
-      + "[0:v]scale=-2:720,fps=30[base];[base][logo]overlay=x=W-w-32:y=H-h-28:shortest=1:format=auto[v]",
+    `[1:v]scale=${width}:-1,format=rgba,colorchannelmixer=aa=${alpha}[logo];`
+      + `[0:v]scale=-2:720,fps=30[base];[base][logo]overlay=${overlayPosition(logoSettings)}:shortest=1:format=auto[v]`,
     "-map", "[v]", "-map", "0:a?",
     ...encode, "-b:v", "3000k", "-maxrate", "3000k", "-bufsize", "6000k",
     "-f", "flv", destination,
@@ -51,18 +76,18 @@ export function slateArgs(destination) {
   ];
 }
 
-// currentSource() returns the RTMP URL to relay, or null for the slate.
-export function startChannelOutput({ currentSource, publishUrl, ffmpegPath = "ffmpeg" }) {
+// currentSource() returns the RTMP URL to relay, or null for the slate; logo() the logo settings.
+export function startChannelOutput({ currentSource, logo = () => DEFAULT_LOGO, publishUrl, ffmpegPath = "ffmpeg" }) {
   let child = null;
-  let running = undefined; // the source the current ffmpeg is relaying (null = slate)
+  let running = undefined; // what the current ffmpeg is sending: source + logo settings
   let retry = null;
   let stopped = false;
   let status = { source: "starting", error: null, since: null };
 
-  function launch(source) {
+  function launch(source, logoSettings, key) {
     clearTimeout(retry);
-    running = source;
-    const args = source ? relayArgs(source, publishUrl()) : slateArgs(publishUrl());
+    running = key;
+    const args = source ? relayArgs(source, publishUrl(), logoSettings) : slateArgs(publishUrl());
     const proc = spawn(ffmpegPath, args, { stdio: ["ignore", "ignore", "pipe"] });
     child = proc;
     status = { source: source ? "relay" : "slate", error: null, since: new Date().toISOString() };
@@ -90,13 +115,16 @@ export function startChannelOutput({ currentSource, publishUrl, ffmpegPath = "ff
   function tick() {
     if (stopped) return;
     const wanted = currentSource();
-    if (child && wanted === running) return;
+    const logoSettings = logo();
+    // A new logo placement restarts the relay (the slate always shows the logo centred).
+    const key = wanted ? `${wanted}|${JSON.stringify(logoSettings)}` : "slate";
+    if (child && key === running) return;
     if (child) {
       const old = child;
       child = null;
       old.kill("SIGTERM");
     }
-    launch(wanted);
+    launch(wanted, logoSettings, key);
   }
 
   const timer = setInterval(tick, checkEveryMs);

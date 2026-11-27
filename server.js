@@ -11,7 +11,7 @@ import { attachSwitcherOutput } from "./switcherOutput.js";
 import { createMediaStore } from "./media.js";
 import { PLATFORMS, startRestreams } from "./restream.js";
 import { attachGuestRoom } from "./guestRoom.js";
-import { startChannelOutput } from "./channelOutput.js";
+import { DEFAULT_LOGO, startChannelOutput } from "./channelOutput.js";
 import { FREQUENCIES, firstOverlap, occurrences, seriesFinished, validTimeZone } from "./breakRepeat.js";
 
 const port = Number(process.env.PORT) || 3001;
@@ -108,7 +108,7 @@ function defaultDb() {
     // What the server plays on its own when nobody is live from the studio.
     channel: { fillPlaylistId: "" },
     // Streaming URL overrides from the Settings page. Blank uses the server's environment default.
-    settings: { hlsBaseUrl: "", rtmpIngestUrl: "" },
+    settings: { hlsBaseUrl: "", rtmpIngestUrl: "", logo: { ...DEFAULT_LOGO } },
     // YouTube / Facebook stream settings, from each platform's live dashboard.
     restream: Object.fromEntries(Object.entries(PLATFORMS).map(([id, platform]) => [id, { serverUrl: platform.defaultServerUrl, streamKey: "" }])),
     // Guest invite links: { id, name, token, createdAt }. Anyone with the link can join as that guest.
@@ -141,7 +141,7 @@ async function loadDb() {
     ...stored,
     live: { ...fallback.live, ...stored.live },
     channel: { ...fallback.channel, ...stored.channel },
-    settings: { ...fallback.settings, ...stored.settings },
+    settings: { ...fallback.settings, ...stored.settings, logo: { ...fallback.settings.logo, ...stored.settings?.logo } },
     restream: Object.fromEntries(Object.keys(PLATFORMS).map((id) => [id, { ...fallback.restream[id], ...stored.restream?.[id] }])),
   };
 }
@@ -423,7 +423,7 @@ const hlsBaseUrl = () => db.settings.hlsBaseUrl || defaultHlsBaseUrl;
 const rtmpUrl = () => db.settings.rtmpIngestUrl || defaultRtmpUrl;
 
 function publicLive() {
-  const { isLive, title, description, startedAt, streamName, encoderConnected } = db.live;
+  const { isLive, title, description, startedAt, encoderConnected } = db.live;
   const run = playout.status();
   const source = isLive ? "live" : run.state === "playing" ? "playlist" : "off";
   // A scheduled show takes over from the playlist, so its videos after that start aren't coming up.
@@ -438,7 +438,8 @@ function publicLive() {
     startedAt,
     encoderConnected,
     nowPlaying: source === "playlist" ? { slotTitle: run.slotTitle, itemTitle: run.itemTitle, nextItemTitle: run.nextItemTitle, upcoming } : null,
-    hlsUrl: `${hlsBaseUrl()}/${source === "playlist" ? playoutStream : streamName}.m3u8`,
+    // Every screen plays the channel feed, which carries the logo where the studio placed it.
+    hlsUrl: `${hlsBaseUrl()}/${channelStream}.m3u8`,
   };
 }
 
@@ -450,6 +451,7 @@ const channelOutput = startChannelOutput({
     if (!db.live.isLive && playout.status().state === "playing") return `${playoutRtmpUrl}/${playoutStream}`;
     return null;
   },
+  logo: () => db.settings.logo,
   publishUrl: () => `${playoutRtmpUrl}/${channelStream}?key=${db.live.streamKey}`,
   ffmpegPath: process.env.FFMPEG_PATH || "ffmpeg",
 });
@@ -500,6 +502,7 @@ function settingsView() {
     playoutHlsUrl: `${hlsBaseUrl()}/${playoutStream}.m3u8`,
     channelHlsUrl: `${hlsBaseUrl()}/${channelStream}.m3u8`,
     channelFeed: channelOutput.status(),
+    logo: db.settings.logo,
     streamName: db.live.streamName,
     live: studioLive(),
   };
@@ -515,6 +518,8 @@ function urlSetting(value, field, pattern, hint) {
 function studioLive() {
   return {
     ...publicLive(),
+    // The studio's Preview monitor watches the encoder itself, before the channel feed.
+    hlsUrl: `${hlsBaseUrl()}/${db.live.streamName}.m3u8`,
     streamName: db.live.streamName,
     streamKey: db.live.streamKey,
     rtmpUrl: rtmpUrl(),
@@ -804,8 +809,28 @@ const routes = [
       db.live.streamName = streamName;
       db.live.encoderConnected = false;
     }
-    db.settings = { hlsBaseUrl, rtmpIngestUrl };
+    db.settings = { ...db.settings, hlsBaseUrl, rtmpIngestUrl };
     await saveDb();
+    sendJson(response, 200, settingsView());
+  }],
+  ["PUT", "/api/studio/settings/logo", true, async (request, response) => {
+    const body = await readJson(request);
+    const positions = ["top-left", "top-right", "bottom-left", "bottom-right"];
+    if (!positions.includes(body.position)) throw new HttpError(400, "Choose a corner for the logo");
+    const number = (value, field, min, max) => {
+      const result = Number(value);
+      if (!Number.isFinite(result) || result < min || result > max) throw new HttpError(400, `${field} must be between ${min} and ${max}`);
+      return Math.round(result * 10) / 10;
+    };
+    db.settings.logo = {
+      enabled: body.enabled !== false,
+      position: body.position,
+      size: number(body.size, "Logo size", 5, 30),
+      opacity: number(body.opacity, "Logo opacity", 20, 100),
+      margin: number(body.margin, "Logo margin", 0, 10),
+    };
+    await saveDb();
+    channelOutput.refresh();
     sendJson(response, 200, settingsView());
   }],
   ["POST", "/api/studio/live/key", true, async (request, response) => {
