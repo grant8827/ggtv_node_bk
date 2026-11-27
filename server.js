@@ -11,6 +11,7 @@ import { attachSwitcherOutput } from "./switcherOutput.js";
 import { createMediaStore } from "./media.js";
 import { PLATFORMS, startRestreams } from "./restream.js";
 import { attachGuestRoom } from "./guestRoom.js";
+import { startChannelOutput } from "./channelOutput.js";
 import { FREQUENCIES, firstOverlap, occurrences, seriesFinished, validTimeZone } from "./breakRepeat.js";
 
 const port = Number(process.env.PORT) || 3001;
@@ -31,6 +32,8 @@ const defaultHlsBaseUrl = (process.env.HLS_BASE_URL || "http://localhost:8080/li
 // This is the server's own connection to SRS, so it stays an environment setting.
 const playoutRtmpUrl = (process.env.PLAYOUT_RTMP_URL || defaultRtmpUrl).replace(/\/$/, "");
 const playoutStream = "playout";
+// The always-on channel feed (live show, else playlist, else a slate) for cable and partners.
+const channelStream = "ggtv";
 const onRailway = Boolean(process.env.RAILWAY_ENVIRONMENT_NAME);
 const secureCookie = process.env.NODE_ENV === "production" || onRailway;
 
@@ -439,6 +442,18 @@ function publicLive() {
   };
 }
 
+// What the channel feed relays right now: the live show once its encoder is sending, else the
+// playlist playout while it plays, else nothing (the feed shows its slate).
+const channelOutput = startChannelOutput({
+  currentSource: () => {
+    if (db.live.isLive && db.live.encoderConnected) return `${playoutRtmpUrl}/${db.live.streamName}`;
+    if (!db.live.isLive && playout.status().state === "playing") return `${playoutRtmpUrl}/${playoutStream}`;
+    return null;
+  },
+  publishUrl: () => `${playoutRtmpUrl}/${channelStream}?key=${db.live.streamKey}`,
+  ffmpegPath: process.env.FFMPEG_PATH || "ffmpeg",
+});
+
 // Pulls the studio's program output back out of SRS and sends it on to YouTube / Facebook.
 const restreams = startRestreams({
   sourceUrl: () => `${playoutRtmpUrl}/${db.live.streamName}`,
@@ -483,6 +498,8 @@ function settingsView() {
     defaults: { hlsBaseUrl: defaultHlsBaseUrl, rtmpIngestUrl: defaultRtmpUrl },
     liveHlsUrl: `${hlsBaseUrl()}/${db.live.streamName}.m3u8`,
     playoutHlsUrl: `${hlsBaseUrl()}/${playoutStream}.m3u8`,
+    channelHlsUrl: `${hlsBaseUrl()}/${channelStream}.m3u8`,
+    channelFeed: channelOutput.status(),
     streamName: db.live.streamName,
     live: studioLive(),
   };
@@ -670,13 +687,15 @@ async function srsHook(request, response, action) {
   // SRS sends the publisher's query string as `param` on both publish and unpublish.
   const key = new URLSearchParams(String(body.param || "").replace(/^\?/, "")).get("key") || "";
   const isEncoder = body.stream === db.live.streamName;
-  if ((!isEncoder && body.stream !== playoutStream) || !timingSafeEqual(digest(key), digest(db.live.streamKey))) {
+  if ((!isEncoder && body.stream !== playoutStream && body.stream !== channelStream) || !timingSafeEqual(digest(key), digest(db.live.streamKey))) {
     sendJson(response, 403, { code: 1 });
     return;
   }
   if (isEncoder) {
     db.live.encoderConnected = action === "publish";
     await saveDb();
+    // Switch the channel feed to (or off) the live show right away.
+    setImmediate(() => channelOutput.refresh());
   }
   sendJson(response, 200, { code: 0 });
 }
@@ -761,6 +780,7 @@ const routes = [
     db.live.isLive = true;
     await saveDb();
     playout.refresh();
+    channelOutput.refresh();
     sendJson(response, 200, studioLive());
   }],
   ["POST", "/api/studio/live/stop", true, async (request, response) => {
@@ -768,6 +788,7 @@ const routes = [
     db.live.startedAt = null;
     await saveDb();
     playout.refresh();
+    channelOutput.refresh();
     sendJson(response, 200, studioLive());
   }],
   ["GET", "/api/studio/settings", true, (request, response) => sendJson(response, 200, settingsView())],
@@ -777,7 +798,7 @@ const routes = [
     const rtmpIngestUrl = urlSetting(body.rtmpIngestUrl, "Encoder server URL", /^rtmps?:\/\/[^\s/]+\S*$/i, "rtmp:// or rtmps://");
     const streamName = text(body.streamName, "Stream name", { min: 1, max: 64 });
     if (!/^[\w-]+$/.test(streamName)) throw new HttpError(400, "Stream name can only use letters, numbers, - and _");
-    if (streamName === playoutStream) throw new HttpError(400, `"${playoutStream}" is used by the server's playlists. Choose another stream name.`);
+    if (streamName === playoutStream || streamName === channelStream) throw new HttpError(400, `"${streamName}" is used by the server's own streams. Choose another stream name.`);
     if (streamName !== db.live.streamName) {
       // Encoders on the old name are no longer the channel's encoder.
       db.live.streamName = streamName;
@@ -1001,6 +1022,7 @@ for (const signal of ["SIGTERM", "SIGINT"]) {
     playout.shutdown();
     switcherOutput.shutdown();
     restreams.shutdown();
+    channelOutput.shutdown();
     guestRoom.shutdown();
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 3000).unref();
