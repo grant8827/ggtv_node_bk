@@ -4,7 +4,8 @@ RUN apk add --no-cache ffmpeg
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
-COPY server.js playout.js switcherOutput.js media.js restream.js guestRoom.js breakRepeat.js ./
+# Every server module, so a new file is never left out of the image.
+COPY *.js ./
 COPY countdown ./countdown
 ENV NODE_ENV=production
 CMD ["node", "server.js"]
